@@ -1,0 +1,23 @@
+# Python runtime artifacts
+python_app/.venv/
+python_app/__pycache__/
+python_app/**/__pycache__/
+python_app/**/*.pyc
+
+# Local user calibration and captured data
+python_app/config/calibration.json
+python_app/data/
+!python_app/data/.gitkeep
+
+# Firmware build artifacts
+firmware/**/.pio/
+
+# Local distribution/build outputs
+.dist/
+
+# Logs and OS/editor noise
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
