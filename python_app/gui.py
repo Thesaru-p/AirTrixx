@@ -22,6 +22,7 @@ from gesture_recorder import GestureRecorder
 from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
+from audio_dock import AudioDockBridge
 
 
 SERVO_BRACKETS = {
@@ -229,6 +230,17 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s: float | None = None
         self.hand_calibration_auto_capture = True
 
+        # Initialize Audio Dock variables and instance
+        self.audio_dock_status_var = tk.StringVar(value="Disconnected")
+        self.audio_dock_last_trigger_var = tk.StringVar(value="-")
+        self.audio_dock_latest_transcript_var = tk.StringVar(value="-")
+        self.audio_dock_port_var = tk.StringVar()
+        self.audio_dock_bridge = AudioDockBridge(
+            on_log=self._on_audio_dock_log,
+            on_status=self._on_audio_dock_status,
+            on_transcript=self._on_audio_dock_transcript,
+        )
+
         self.serial_bridge.on_log = self.log
         self.hand_tracker.on_log = self.log
         self.recorder = GestureRecorder(
@@ -331,7 +343,7 @@ class AirTrixxGUI:
 
         nav_frame = ttk.Frame(sidebar, style="Panel.TFrame")
         nav_frame.grid(row=3, column=0, sticky="ew")
-        nav_items = ("Dashboard", "Camera", "Keyboard", "Live Data", "Servo Control", "Firmware", "Calibration", "Logs / Debug")
+        nav_items = ("Dashboard", "Camera", "Keyboard", "Live Data", "Audio Dock", "Servo Control", "Firmware", "Calibration", "Logs / Debug")
         for row, name in enumerate(nav_items):
             button = ttk.Button(nav_frame, text=name, style="Nav.TButton", command=lambda page=name: self.show_page(page))
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
@@ -354,6 +366,7 @@ class AirTrixxGUI:
         self._build_camera_page(self.pages["Camera"])
         self._build_keyboard_page(self.pages["Keyboard"])
         self._build_live_data_page(self.pages["Live Data"])
+        self._build_audio_dock_page(self.pages["Audio Dock"])
         self._build_servo_page(self.pages["Servo Control"])
         self._build_firmware_page(self.pages["Firmware"])
         self._build_calibration_page(self.pages["Calibration"])
@@ -602,6 +615,98 @@ class AirTrixxGUI:
         ttk.Entry(record_box, textvariable=self.duration_var, width=10).grid(row=2, column=1, sticky="w", pady=(6, 0))
         self.record_button = ttk.Button(record_box, text="Record Gesture", command=self.record_gesture, style="Accent.TButton")
         self.record_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _build_audio_dock_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Audio Dock", "Real-time Edge Impulse clap detection and Deepgram transcription inputs.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        # Controls box
+        controls = ttk.LabelFrame(body, text="Connection Controls", padding=10)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="COM Port").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        
+        self.audio_port_combo = ttk.Combobox(
+            controls,
+            textvariable=self.audio_dock_port_var,
+            state="readonly",
+            width=26,
+        )
+        self.audio_port_combo.grid(row=0, column=1, sticky="w")
+        
+        # Populate port list
+        self._refresh_audio_ports()
+
+        ttk.Button(controls, text="Refresh Ports", command=self._refresh_audio_ports, style="Secondary.TButton").grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+        self.audio_connect_button = ttk.Button(controls, text="Connect", command=self.toggle_audio_dock, style="Accent.TButton")
+        self.audio_connect_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        # Status displays
+        status_box = ttk.LabelFrame(body, text="Status & Readings", padding=10)
+        status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status_box.columnconfigure(1, weight=1)
+
+        ttk.Label(status_box, text="Connection Status:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(status_box, textvariable=self.audio_dock_status_var, font=("Segoe UI Semibold", 10)).grid(row=0, column=1, sticky="w", pady=4, padx=8)
+
+        ttk.Label(status_box, text="Last AI Clap Trigger:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(status_box, textvariable=self.audio_dock_last_trigger_var, font=("Segoe UI Semibold", 10)).grid(row=1, column=1, sticky="w", pady=4, padx=8)
+
+        ttk.Label(status_box, text="Latest Transcription:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(status_box, textvariable=self.audio_dock_latest_transcript_var, font=("Segoe UI Semibold", 10)).grid(row=2, column=1, sticky="w", pady=4, padx=8)
+
+        # Log box
+        log_box = ttk.LabelFrame(body, text="Audio Dock Console Log", padding=10)
+        log_box.grid(row=2, column=0, sticky="nsew")
+        log_box.rowconfigure(0, weight=1)
+        log_box.columnconfigure(0, weight=1)
+
+        self.audio_log_text = tk.Text(log_box, height=12, wrap="word")
+        self.audio_log_text.grid(row=0, column=0, sticky="nsew")
+        self._style_text_widget(self.audio_log_text, dark=True)
+        self._register_scroll_target(self.audio_log_text, self.audio_log_text)
+
+    def toggle_audio_dock(self) -> None:
+        if self.audio_dock_bridge.is_connected:
+            self.audio_dock_bridge.disconnect()
+            self.audio_connect_button.configure(text="Connect")
+            return
+
+        selected = self.audio_dock_port_var.get().split(" - ", 1)[0].strip() or None
+        if not selected:
+            self.log("Please select a COM port for the Audio Dock.")
+            return
+
+        if self.audio_dock_bridge.connect(selected):
+            self.audio_connect_button.configure(text="Disconnect")
+        else:
+            self.log("Failed to connect to Audio Dock.")
+
+    def _refresh_audio_ports(self) -> None:
+        ports = self.serial_bridge.available_ports()
+        values = [self._serial_port_label(p) for p in ports]
+        self.audio_port_combo["values"] = values
+        if values and not self.audio_dock_port_var.get():
+            self.audio_dock_port_var.set(values[0])
+
+    def _on_audio_dock_log(self, message: str) -> None:
+        self.log(message)
+        if hasattr(self, "audio_log_text") and self.audio_log_text.winfo_exists():
+            timestamp = time.strftime("%H:%M:%S")
+            self.audio_log_text.insert("end", f"[{timestamp}] {message}\n")
+            self.audio_log_text.see("end")
+
+    def _on_audio_dock_status(self, status: str) -> None:
+        self.audio_dock_status_var.set(status)
+
+    def _on_audio_dock_transcript(self, trigger: str, text: str) -> None:
+        self.audio_dock_last_trigger_var.set(trigger)
+        self.audio_dock_latest_transcript_var.set(text)
+        self.log(f"Audio Dock Trigger: {trigger} | Transcript: {text}")
 
     def _build_firmware_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Firmware", "Wireless firmware updates through the antenna bridge.")
@@ -2190,6 +2295,17 @@ class AirTrixxGUI:
         add("MediaPipe", "left_score", left.get("score"))
         add("Gesture Recorder", "recording", self.recorder.is_recording)
         add("Gesture Recorder", "gesture_name", self.gesture_name_var.get())
+
+        # Audio Dock status and readings
+        add("Audio Dock", "status", self.audio_dock_bridge.status)
+        add("Audio Dock", "last_trigger", self.audio_dock_bridge.last_trigger)
+        add("Audio Dock", "latest_transcript", self.audio_dock_bridge.latest_transcript)
+
+        # Overwrite audiodock_input in fused input
+        if self.audio_dock_bridge.latest_transcript:
+            input_dict["audiodock_input"] = self.audio_dock_bridge.latest_transcript
+        else:
+            input_dict["audiodock_input"] = "TBD"
 
         for field in FIELD_ORDER:
             add("Fused Input", field, input_dict.get(field))
