@@ -240,6 +240,9 @@ class AirTrixxGUI:
             on_status=self._on_audio_dock_status,
             on_transcript=self._on_audio_dock_transcript,
         )
+        self.audio_dock_bridge.serial_bridge = self.serial_bridge
+        self.serial_bridge.audio_dock_bridge = self.audio_dock_bridge
+
 
         self.serial_bridge.on_log = self.log
         self.hand_tracker.on_log = self.log
