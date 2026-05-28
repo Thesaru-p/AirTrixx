@@ -32,7 +32,7 @@ static VL53L0X *tofSensors[SENSOR_COUNT] = {&sensor0, &sensor1, &sensor2, &senso
 
 static bool sensorReady[SENSOR_COUNT] = {};
 static bool distanceValid[SENSOR_COUNT] = {};
-static uint8_t sensorChannel[SENSOR_COUNT] = {NO_CHANNEL, NO_CHANNEL, NO_CHANNEL};
+static uint8_t sensorChannel[SENSOR_COUNT] = {NO_CHANNEL, NO_CHANNEL, NO_CHANNEL, NO_CHANNEL};
 static uint16_t distanceMm[SENSOR_COUNT] = {};
 static uint16_t keyboardSequence = 0;
 static uint32_t lastReportMs = 0;
