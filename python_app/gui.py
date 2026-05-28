@@ -465,7 +465,7 @@ class AirTrixxGUI:
         self.preview_label.grid(row=0, column=0, sticky="w")
 
     def _build_keyboard_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Keyboard", "Three ToF lanes mapped from 0 to 300 mm in 10 mm bands.")
+        self._build_page_header(page, "Keyboard", "Four ToF lanes mapped from 0 to 300 mm in 10 mm bands.")
         body = self._scrollable_body(page)
         body.columnconfigure(0, weight=1)
 
