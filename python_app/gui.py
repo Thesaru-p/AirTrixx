@@ -31,6 +31,7 @@ SERVO_BRACKETS = {
 }
 
 CAMERA_SOURCE_INDICES = {
+    "Auto (first available)": -1,
     "USB camera": 1,
     "Built-in camera": 0,
 }
@@ -475,13 +476,13 @@ class AirTrixxGUI:
 
         grid_box = ttk.LabelFrame(body, text="ToF Distance Grid", padding=10)
         grid_box.grid(row=1, column=0, sticky="ew")
-        for col in range(4):
+        for col in range(5):
             grid_box.columnconfigure(col, weight=1 if col > 0 else 0)
 
         header_style = {"bg": "#e7edf7", "fg": "#1f2d3d", "font": ("Segoe UI", 10, "bold")}
         cell_style = {"bg": "#f8fafc", "fg": "#1f2d3d", "font": ("Segoe UI", 10), "relief": "solid", "bd": 1}
         tk.Label(grid_box, text="Band", padx=8, pady=8, **header_style).grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
-        for col in range(3):
+        for col in range(4):
             tk.Label(grid_box, text=f"Sensor {col + 1}", padx=8, pady=8, **header_style).grid(
                 row=0, column=col + 1, sticky="nsew", padx=1, pady=1
             )
@@ -496,7 +497,7 @@ class AirTrixxGUI:
                 row=row + 1, column=0, sticky="nsew", padx=1, pady=1
             )
             cells: list[tk.Label] = []
-            for col in range(3):
+            for col in range(4):
                 label = tk.Label(grid_box, text="", width=14, padx=8, pady=7, **cell_style)
                 label.grid(row=row + 1, column=col + 1, sticky="nsew", padx=1, pady=1)
                 cells.append(label)
@@ -1527,7 +1528,7 @@ class AirTrixxGUI:
         for source, index in CAMERA_SOURCE_INDICES.items():
             if index == camera_index:
                 return source
-        return "Built-in camera"
+        return "Auto (first available)"
 
     def calibrate_camera_center(self) -> None:
         if self._apply_calibration_entries() is None:
@@ -2076,7 +2077,7 @@ class AirTrixxGUI:
                 cell.configure(bg=inactive_bg, fg=inactive_fg, text="")
 
         distance_text: list[str] = []
-        for index in range(3):
+        for index in range(4):
             sensor_key = f"sensor_{index + 1}"
             distance = tof.get(f"{sensor_key}_mm") if isinstance(tof, dict) else None
             is_valid = bool(valid.get(sensor_key)) if isinstance(valid, dict) else distance is not None
@@ -2145,7 +2146,7 @@ class AirTrixxGUI:
 
         add("Keyboard", "status", keyboard.get("status") if isinstance(keyboard, dict) else None)
         add("Keyboard", "sequence", keyboard.get("sequence") if isinstance(keyboard, dict) else None)
-        for sensor_index in range(1, 4):
+        for sensor_index in range(1, 5):
             add("Keyboard", f"sensor_{sensor_index}_mm", keyboard_tof.get(f"sensor_{sensor_index}_mm") if isinstance(keyboard_tof, dict) else None)
             add("Keyboard", f"sensor_{sensor_index}_valid", keyboard_valid.get(f"sensor_{sensor_index}") if isinstance(keyboard_valid, dict) else None)
 
