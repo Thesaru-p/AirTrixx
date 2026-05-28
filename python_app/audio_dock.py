@@ -19,7 +19,6 @@ except Exception:
     serial = None
     list_ports = None
 
-DEFAULT_BAUD = 115200
 DEFAULT_MODEL = "nova-3"
 DEFAULT_LANGUAGE = "en-IN"
 
@@ -30,19 +29,18 @@ class AudioDockBridge:
         on_log: Callable[[str], None] | None = None,
         on_status: Callable[[str], None] | None = None,
         on_transcript: Callable[[str, str], None] | None = None,
+        serial_bridge: Any | None = None,
     ) -> None:
         self.on_log = on_log
         self.on_status = on_status
         self.on_transcript = on_transcript  # Callback takes (clap_type, text)
-        self._serial = None
-        self._serial_lock = threading.RLock()
-        self._thread = None
-        self._stop_event = threading.Event()
+        self.serial_bridge = serial_bridge
         self.is_connected = False
-        self.current_port = None
         self.latest_transcript = ""
         self.last_trigger = "-"
         self.status = "Disconnected"
+        self.expected_audio_size = None
+        self.audio_buffer = bytearray()
 
     def _log(self, message: str) -> None:
         if self.on_log:
@@ -59,230 +57,151 @@ class AudioDockBridge:
             return env_key
         raise RuntimeError("DEEPGRAM_API_KEY environment variable not found.")
 
-    def connect(self, port: str) -> bool:
-        if serial is None:
-            self._log("pyserial is not installed.")
-            return False
-
-        if self.is_connected:
-            return True
-
+    def connect(self, port: str | None = None) -> bool:
         try:
             self.load_deepgram_key()
         except Exception as exc:
             self._log(f"Error: {exc}")
             return False
 
-        try:
-            ser = serial.Serial(
-                port=port,
-                baudrate=DEFAULT_BAUD,
-                timeout=1,
-                write_timeout=10,
-            )
-            self._serial = ser
-            self.current_port = port
-            self.is_connected = True
-            self._stop_event.clear()
-            self._set_status("Connected")
-            self._log(f"Connected to {port} successfully.")
+        if not self.serial_bridge:
+            self._log("Error: Serial bridge reference not set.")
+            return False
 
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-            self._thread.start()
-            return True
-        except Exception as exc:
-            self._log(f"Connection failed to {port}: {exc}")
+        if not self.serial_bridge.is_connected:
+            self._log("Error: Antenna is not connected. Please connect the Antenna first on the Live Data / Fused Input page.")
             self._set_status("Error")
             return False
 
+        self.is_connected = True
+        self._set_status("Waiting for Clap")
+        self._log("Connected wirelessly via Antenna ESP-NOW bridge.")
+        self._log("Waiting for clap detection and audio stream...")
+        return True
+
     def disconnect(self) -> None:
-        self._stop_event.set()
         self.is_connected = False
-        self.current_port = None
+        self.expected_audio_size = None
+        self.audio_buffer = bytearray()
         self._set_status("Disconnected")
-        
-        with self._serial_lock:
-            if self._serial:
-                try:
-                    self._serial.close()
-                except Exception:
-                    pass
-                self._serial = None
         self._log("Disconnected.")
 
-    def _read_line(self) -> str | None:
-        with self._serial_lock:
-            if not self._serial:
-                return None
+    def handle_antenna_line(self, line: str) -> None:
+        if not self.is_connected:
+            return
+
+        if "TRIGGER:" in line:
+            # If we are already receiving audio, ignore duplicate or delayed triggers
+            if self.expected_audio_size is not None:
+                return
             try:
-                raw = self._serial.readline()
-            except Exception:
-                return None
-        if not raw:
-            return None
-        return raw.decode("utf-8", errors="replace").strip()
-
-    def _write_line(self, data: bytes) -> bool:
-        with self._serial_lock:
-            if not self._serial:
-                return False
-            try:
-                self._serial.write(data)
-                self._serial.flush()
-                return True
-            except Exception as exc:
-                self._log(f"Write failed: {exc}")
-                return False
-
-    def _wait_for_ready(self, timeout_s: float) -> bool:
-        self._log("Waiting for ESP32 READY...")
-        deadline = time.monotonic() + timeout_s
-
-        while time.monotonic() < deadline and not self._stop_event.is_set():
-            line = self._read_line()
-            if not line:
-                continue
-            self._log(f"ESP32: {line}")
-            if "READY" in line:
-                return True
-
-        self._log("ESP32 READY not seen. Proceeding anyway.")
-        return False
-
-    def _run_loop(self) -> None:
-        try:
-            self._serial.reset_input_buffer()
-            time.sleep(1.0)
-            self._wait_for_ready(10.0)
-
-            while not self._stop_event.is_set():
-                self._set_status("Waiting for Clap")
-                self._log("Sending RECORD command to start clap listener...")
-                if not self._write_line(b"RECORD\n"):
-                    self._log("Failed to send command. Reconnecting...")
-                    break
-
-                audio_size = None
-                self._log("Waiting for clap detection and audio stream...")
+                trigger_str = line.split("TRIGGER:", 1)[1]
+                parts = trigger_str.split(",")
+                clap_type = int(parts[0].strip())
+                audio_size = int(parts[1].strip())
                 
-                while audio_size is None and not self._stop_event.is_set():
-                    line = self._read_line()
-                    if not line:
-                        continue
-                    self._log(f"ESP32: {line}")
-                    
-                    if "Triggered!" in line:
-                        self._set_status("Clap Detected")
-                        # Parse type: e.g. "Triggered! Detected: Double clap with score 0.96"
-                        match = re.search(r'Detected:\s*([A-Za-z\s]+)\s*with', line)
-                        if match:
-                          self.last_trigger = match.group(1).strip()
-                        else:
-                          self.last_trigger = "Clap"
-                          
-                    elif "RECORDING_START" in line:
-                        self._set_status("Recording")
-                        
-                    elif line.startswith("AUDIO_BEGIN "):
-                        try:
-                            audio_size = int(line.split()[1])
-                        except Exception:
-                            pass
-
-                if self._stop_event.is_set() or audio_size is None:
-                    break
-
+                self.expected_audio_size = audio_size
+                self.audio_buffer = bytearray()
+                self.last_trigger = "Double clap" if clap_type == 2 else "Single clap"
                 self._set_status("Receiving Audio")
-                self._log(f"Receiving {audio_size} bytes of WAV audio...")
+                self._log(f"Clap detected: {self.last_trigger}. Expecting {audio_size} bytes of WAV audio.")
+            except Exception as exc:
+                self._log(f"Failed to parse trigger: {exc}")
+
+        elif self.expected_audio_size is not None and (
+            "AUDIO:" in line or 
+            "AUDIO_CHUNK" in line or 
+            len(line) > 100
+        ):
+            try:
+                normalized = line
+                for prefix in ["AUDIODOCK_AUDIO:", "UDIODOCK_AUDIO:", "DIODOCK_AUDIO:", "IODOCK_AUDIO:", "AUDIO:"]:
+                    normalized = normalized.replace(prefix, "|")
                 
-                chunks = []
-                received = 0
-                deadline = time.monotonic() + max(30.0, audio_size / 5000.0)
+                if "|" not in normalized:
+                    chunks = [normalized]
+                else:
+                    chunks = normalized.split("|")
 
-                while received < audio_size and not self._stop_event.is_set():
-                    if time.monotonic() > deadline:
-                        self._log("Timed out receiving WAV data.")
-                        break
-
-                    with self._serial_lock:
-                        if not self._serial:
-                            break
-                        try:
-                            chunk = self._serial.read(min(4096, audio_size - received))
-                        except Exception:
-                            chunk = None
-
+                for chunk in chunks:
+                    chunk = chunk.strip()
                     if not chunk:
-                        time.sleep(0.01)
                         continue
-
-                    chunks.append(chunk)
-                    received += len(chunk)
-
-                if self._stop_event.is_set() or received < audio_size:
-                    break
-
-                audio = b"".join(chunks)
-                self._log("WAV audio successfully received.")
-                
-                # Save to disk as history
-                wav_path = Path(__file__).parent / "last_esp32_recording.wav"
-                try:
-                    wav_path.write_bytes(audio)
-                except Exception:
-                    pass
-
-                # Stream audio end
-                while not self._stop_event.is_set():
-                    line = self._read_line()
-                    if not line:
+                    
+                    # Extract the contiguous trailing hex digits (skipping any prefix)
+                    match = re.search(r'[0-9a-fA-F]+$', chunk)
+                    if not match:
                         continue
-                    self._log(f"ESP32: {line}")
-                    if line == "AUDIO_END":
-                        break
-
-                self._set_status("Transcribing")
-                self._log("Uploading audio to Deepgram API...")
-                
-                try:
-                    api_key = self.load_deepgram_key()
-                    transcript = self._transcribe(audio, api_key)
-                    self._log(f"Transcript: \"{transcript}\"")
-                except Exception as exc:
-                    self._log(f"Transcribe error: {exc}")
-                    transcript = "[Transcription Error]"
-
-                self._set_status("Sending Transcript")
-                clean = transcript.replace("\r", " ").replace("TRANSCRIPT_BEGIN", "").replace("TRANSCRIPT_END", "")
-                
-                self._write_line(b"TRANSCRIPT_BEGIN\n")
-                if clean:
-                    for l in clean.splitlines():
-                        self._write_line(l.encode("utf-8", errors="replace") + b"\n")
-                self._write_line(b"TRANSCRIPT_END\n")
-
-                self.latest_transcript = transcript
-                if self.on_transcript:
-                    self.on_transcript(self.last_trigger, transcript)
-
-                # Wait for bridge done
-                self._log("Waiting for ESP32 acknowledgement...")
-                done_deadline = time.monotonic() + 5.0
-                while time.monotonic() < done_deadline and not self._stop_event.is_set():
-                    line = self._read_line()
-                    if not line:
+                    
+                    hex_data = match.group(0)
+                    
+                    # Verify by length to ignore any small segments or JSON frames
+                    if len(hex_data) < 40:
                         continue
-                    self._log(f"ESP32: {line}")
-                    if "BRIDGE_DONE" in line:
-                        break
+                    
+                    if len(hex_data) % 2 != 0:
+                        hex_data = hex_data[:-1]  # Ensure even length for fromhex()
+                    
+                    chunk_bytes = bytes.fromhex(hex_data)
+                    self.audio_buffer.extend(chunk_bytes)
+                
+                # Periodically log progress so user has visual feedback
+                total_len = len(self.audio_buffer)
+                if total_len > 0 and ((total_len // 200) % 40 == 0 or total_len >= self.expected_audio_size):
+                    self._log(f"Receiving audio... {total_len}/{self.expected_audio_size} bytes.")
 
-                self._log("Bridge transaction finished. Looping...")
-                time.sleep(1.0)
+                if total_len >= self.expected_audio_size:
+                    expected = self.expected_audio_size
+                    self.expected_audio_size = None  # Prevent duplicate triggers
+                    
+                    self._log("WAV audio successfully received wireless.")
+                    # Crop buffer to exactly expected size to guarantee perfect WAV structure
+                    audio_data = bytes(self.audio_buffer[:expected])
+                    
+                    wav_path = Path(__file__).parent / "last_esp32_recording.wav"
+                    try:
+                        wav_path.write_bytes(audio_data)
+                    except Exception:
+                        pass
+                    
+                    self._set_status("Transcribing")
+                    threading.Thread(target=self._transcribe_and_send, args=(audio_data,), daemon=True).start()
+            except Exception as exc:
+                self._log(f"Failed to parse audio chunk: {exc}")
 
+    def _transcribe_and_send(self, audio_data: bytes) -> None:
+        try:
+            self._log("Uploading audio to Deepgram API...")
+            api_key = self.load_deepgram_key()
+            transcript = self._transcribe(audio_data, api_key)
+            self._log(f"Transcript: \"{transcript}\"")
         except Exception as exc:
-            self._log(f"Bridge loop error: {exc}")
-        finally:
-            self.disconnect()
+            self._log(f"Transcribe error: {exc}")
+            transcript = "[Transcription Error]"
+
+        self._set_status("Sending Transcript")
+        self.latest_transcript = transcript
+
+        # Send to Antenna which will forward to Audio Dock over ESP-NOW
+        cmd = {
+            "cmd": "audiodock",
+            "transcript": transcript
+        }
+        if self.serial_bridge.send_command(cmd):
+            self._log("Transcript command successfully sent to Antenna.")
+        else:
+            self._log("Failed to send transcript command to Antenna.")
+
+        if self.on_transcript:
+            self.on_transcript(self.last_trigger, transcript)
+
+        # Show transcript for 2 seconds, then return to waiting state
+        time.sleep(2.0)
+        if self.is_connected:
+            self.expected_audio_size = None
+            self.audio_buffer = bytearray()
+            self._set_status("Waiting for Clap")
+            self._log("Waiting for next clap detection...")
 
     def _transcribe(self, audio: bytes, api_key: str) -> str:
         query = {
@@ -301,8 +220,12 @@ class AudioDockBridge:
             method="POST",
         )
 
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Deepgram HTTP {exc.code}: {details}") from exc
 
         data = json.loads(body)
         try:

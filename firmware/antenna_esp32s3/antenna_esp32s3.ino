@@ -11,6 +11,8 @@
 #include "AirTrixxProtocol.h"
 #endif
 
+static SemaphoreHandle_t serialMutex = NULL;
+
 struct LatestWristband {
   bool seen = false;
   uint32_t received_ms = 0;
@@ -41,6 +43,12 @@ struct LatestKeyboard {
   KeyboardTofPacket packet = {};
 };
 
+struct LatestAudioDock {
+  bool seen = false;
+  uint32_t received_ms = 0;
+  AudioDockDataPacket packet = {};
+};
+
 struct AIRTRIXX_PACKED LegacyFanStatusPacket {
   AirTrixxPacketHeader header;
   uint8_t fan_on;
@@ -56,6 +64,7 @@ static LatestBatteryStatus latestWristbandBattery;
 static LatestCamDock latestCamDock;
 static LatestFans latestFans;
 static LatestKeyboard latestKeyboard;
+static LatestAudioDock latestAudioDock;
 static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint16_t antennaJsonSequence = 0;
@@ -63,6 +72,11 @@ static uint16_t servoCommandSequence = 0;
 static uint16_t otaCommandSequence = 0;
 static uint16_t fanCommandSequence = 0;
 static uint32_t lastJsonMs = 0;
+static bool isStreamingAudioDock = false;
+static uint32_t lastAudioDockChunkMs = 0;
+static const uint32_t AUDIODOCK_STREAM_TIMEOUT_MS = 6000;
+
+static QueueHandle_t audioChunkQueue = NULL;
 
 static char serialLine[768];
 static size_t serialLineLen = 0;
@@ -72,7 +86,10 @@ static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 
 void debugPrintln(const String &message) {
   if (DEBUG_SERIAL) {
-    Serial.println(message);
+    if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.println(message);
+      xSemaphoreGive(serialMutex);
+    }
   }
 }
 
@@ -394,6 +411,26 @@ void handleSerialJsonCommand(const String &line) {
     handleFanJsonCommand(line);
     return;
   }
+  if (cmd == "audiodock") {
+    String transcript;
+    if (extractStringField(line, "transcript", transcript)) {
+      AudioDockTranscriptPacket packet = {};
+      fillHeader(packet.header,
+                 MSG_AUDIODOCK_TRANSCRIPT,
+                 DEVICE_ANTENNA,
+                 ++antennaJsonSequence,
+                 millis(),
+                 false);
+      copyStringToPacketField(packet.transcript, transcript);
+      esp_err_t result = esp_now_send(AUDIODOCK_MAC_PLACEHOLDER,
+                                      reinterpret_cast<const uint8_t *>(&packet),
+                                      sizeof(packet));
+      if (result != ESP_OK) {
+        debugPrintln("ESP-NOW audiodock transcript send failed: " + String(result));
+      }
+    }
+    return;
+  }
   if (cmd != "servo") {
     debugPrintln("Unsupported command: " + cmd);
     return;
@@ -449,29 +486,40 @@ void handleSerialJsonCommand(const String &line) {
 }
 
 void pumpSerialCommands() {
-  while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\r') {
-      continue;
-    }
-    if (c == '\n') {
-      serialLine[serialLineLen] = '\0';
-      if (serialLineLen > 0) {
-        String line(serialLine);
-        line.trim();
-        if (line.length() > 0) {
-          handleSerialJsonCommand(line);
-        }
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    while (Serial.available() > 0) {
+      char c = static_cast<char>(Serial.read());
+      if (c == '\r') {
+        continue;
       }
-      serialLineLen = 0;
-      continue;
+      if (c == '\n') {
+        serialLine[serialLineLen] = '\0';
+        if (serialLineLen > 0) {
+          String line(serialLine);
+          line.trim();
+          if (line.length() > 0) {
+            // Unlock mutex before calling command handler to prevent recursive deadlocks
+            xSemaphoreGive(serialMutex);
+            handleSerialJsonCommand(line);
+            if (xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) {
+              serialLineLen = 0;
+              return;
+            }
+          }
+        }
+        serialLineLen = 0;
+        continue;
+      }
+      if (serialLineLen < sizeof(serialLine) - 1) {
+        serialLine[serialLineLen++] = c;
+      } else {
+        serialLineLen = 0;
+        xSemaphoreGive(serialMutex);
+        debugPrintln("Serial command too long; dropped");
+        if (xSemaphoreTake(serialMutex, portMAX_DELAY) != pdTRUE) return;
+      }
     }
-    if (serialLineLen < sizeof(serialLine) - 1) {
-      serialLine[serialLineLen++] = c;
-    } else {
-      serialLineLen = 0;
-      debugPrintln("Serial command too long; dropped");
-    }
+    xSemaphoreGive(serialMutex);
   }
 }
 
@@ -555,6 +603,38 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     latestFans.seen = true;
     latestFans.received_ms = millis();
     portEXIT_CRITICAL(&stateMux);
+  } else if (header.msg_type == MSG_AUDIODOCK_DATA && len == static_cast<int>(sizeof(AudioDockDataPacket))) {
+    AudioDockDataPacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.header.device_id != DEVICE_AUDIODOCK) {
+      return;
+    }
+    portENTER_CRITICAL(&stateMux);
+    latestAudioDock.packet = packet;
+    latestAudioDock.seen = true;
+    latestAudioDock.received_ms = millis();
+    portEXIT_CRITICAL(&stateMux);
+    
+    isStreamingAudioDock = true;
+    lastAudioDockChunkMs = millis();
+    
+    if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.printf("AUDIODOCK_TRIGGER:%d,%d\n", packet.clap_type, packet.audio_size);
+      xSemaphoreGive(serialMutex);
+    }
+  } else if (header.msg_type == MSG_AUDIODOCK_AUDIO_CHUNK && len == static_cast<int>(sizeof(AudioDockChunkPacket))) {
+    AudioDockChunkPacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.header.device_id != DEVICE_AUDIODOCK) {
+      return;
+    }
+    
+    isStreamingAudioDock = true;
+    lastAudioDockChunkMs = millis();
+    
+    if (audioChunkQueue != NULL) {
+      xQueueSend(audioChunkQueue, &packet, 0);
+    }
   } else if (DEBUG_SERIAL) {
     debugPrintln("Unexpected ESP-NOW packet type/size");
   }
@@ -895,12 +975,42 @@ void printFutureDeviceJson(const char *name) {
   Serial.print("\":{\"status\":\"TBD\",\"input\":\"TBD\",\"battery_level\":null}");
 }
 
+void printAudioDockJson(const LatestAudioDock &snapshot, uint32_t nowMs) {
+  bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
+  Serial.print("\"audiodock\":{");
+  Serial.print("\"status\":\"");
+  Serial.print(ok ? "ok" : "not_connected");
+  Serial.print("\",\"battery_level\":null");
+  Serial.print(",\"sequence\":");
+  if (ok) {
+    Serial.print(snapshot.packet.header.sequence);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"t_ms\":");
+  if (ok) {
+    Serial.print(snapshot.packet.header.t_ms);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"clap_detected\":");
+  Serial.print(ok && snapshot.packet.clap_detected ? "true" : "false");
+  Serial.print(",\"clap_type\":");
+  if (ok) {
+    Serial.print(snapshot.packet.clap_type);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print("}");
+}
+
 void printJsonState() {
   LatestWristband wristSnapshot;
   LatestBatteryStatus wristBatterySnapshot;
   LatestCamDock camSnapshot;
   LatestFans fansSnapshot;
   LatestKeyboard keyboardSnapshot;
+  LatestAudioDock audiodockSnapshot;
   uint32_t nowMs = millis();
 
   portENTER_CRITICAL(&stateMux);
@@ -909,32 +1019,67 @@ void printJsonState() {
   camSnapshot = latestCamDock;
   fansSnapshot = latestFans;
   keyboardSnapshot = latestKeyboard;
+  audiodockSnapshot = latestAudioDock;
   portEXIT_CRITICAL(&stateMux);
 
-  Serial.print("{\"t_ms\":");
-  Serial.print(nowMs);
-  Serial.print(",\"sequence\":");
-  Serial.print(++antennaJsonSequence);
-  Serial.print(",\"devices\":{");
-  printWristbandJson(wristSnapshot, wristBatterySnapshot, nowMs);
-  Serial.print(",");
-  printCamDockJson(camSnapshot, nowMs);
-  Serial.print(",");
-  printKeyboardJson(keyboardSnapshot, nowMs);
-  Serial.print(",");
-  printFutureDeviceJson("charging_dock");
-  Serial.print(",");
-  printFutureDeviceJson("audiodock");
-  Serial.print(",");
-  printFansJson(fansSnapshot, nowMs);
-  Serial.println("}}");
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.print("{\"t_ms\":");
+    Serial.print(nowMs);
+    Serial.print(",\"sequence\":");
+    Serial.print(++antennaJsonSequence);
+    
+    uint8_t mac[6] = {};
+    WiFi.macAddress(mac);
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.print(",\"antenna_mac\":\"");
+    Serial.print(macStr);
+    Serial.print("\"");
+
+    Serial.print(",\"devices\":{");
+    printWristbandJson(wristSnapshot, wristBatterySnapshot, nowMs);
+    Serial.print(",");
+    printCamDockJson(camSnapshot, nowMs);
+    Serial.print(",");
+    printKeyboardJson(keyboardSnapshot, nowMs);
+    Serial.print(",");
+    printFutureDeviceJson("charging_dock");
+    Serial.print(",");
+    printAudioDockJson(audiodockSnapshot, nowMs);
+    Serial.print(",");
+    printFansJson(fansSnapshot, nowMs);
+    Serial.println("}}");
+    xSemaphoreGive(serialMutex);
+  }
 }
 
 void setup() {
+  Serial.setRxBufferSize(2048);
+  Serial.setTxBufferSize(2048);
   Serial.begin(AIRTRIXX_SERIAL_BAUD);
   delay(200);
 
+  // Initialize the thread-safe FreeRTOS Mutex for Serial operations
+  serialMutex = xSemaphoreCreateMutex();
+
+  // Create FreeRTOS queue for Audio Dock chunks
+  audioChunkQueue = xQueueCreate(64, sizeof(AudioDockChunkPacket));
+
   configureWiFiChannel();
+  
+  // Read and print actual physical MAC address
+  uint8_t mac[6] = {};
+  WiFi.macAddress(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.print("ANTENNA_MAC: ");
+    Serial.println(macStr);
+    xSemaphoreGive(serialMutex);
+  }
+
   if (esp_now_init() != ESP_OK) {
     debugPrintln("ESP-NOW init failed");
     return;
@@ -944,15 +1089,43 @@ void setup() {
   addEspNowPeer(WRISTBAND_MAC_PLACEHOLDER);
   addEspNowPeer(KEYBOARD_MAC_PLACEHOLDER);
   addEspNowPeer(FANS_MAC_PLACEHOLDER);
+  addEspNowPeer(AUDIODOCK_MAC_PLACEHOLDER);
   addEspNowPeer(ESPNOW_BROADCAST_MAC);
 }
 
+void pumpAudioDockChunks() {
+  if (audioChunkQueue == NULL) return;
+
+  AudioDockChunkPacket packet;
+  while (xQueueReceive(audioChunkQueue, &packet, 0) == pdPASS) {
+    char hexBuf[401];
+    uint16_t writeLen = packet.chunk_len;
+    if (writeLen > 200) writeLen = 200;
+    for (uint16_t i = 0; i < writeLen; ++i) {
+      sprintf(hexBuf + (i * 2), "%02X", packet.data[i]);
+    }
+    hexBuf[writeLen * 2] = '\0';
+    
+    if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.print("AUDIODOCK_AUDIO:");
+      Serial.println(hexBuf);
+      xSemaphoreGive(serialMutex);
+    }
+  }
+}
+
 void loop() {
+  pumpAudioDockChunks();
   pumpSerialCommands();
 
   uint32_t nowMs = millis();
+  
+  if (isStreamingAudioDock && (nowMs - lastAudioDockChunkMs >= AUDIODOCK_STREAM_TIMEOUT_MS)) {
+    isStreamingAudioDock = false;
+  }
+
   const uint32_t intervalMs = 1000UL / ANTENNA_JSON_HZ;
-  if (nowMs - lastJsonMs >= intervalMs) {
+  if (!isStreamingAudioDock && (nowMs - lastJsonMs >= intervalMs)) {
     lastJsonMs = nowMs;
     printJsonState();
   }
