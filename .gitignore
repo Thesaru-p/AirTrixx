@@ -6,7 +6,7 @@ python_app/**/*.pyc
 
 # Local user calibration and captured data
 python_app/config/calibration.json
-python_app/data/
+#python_app/data/
 !python_app/data/.gitkeep
 
 # Firmware build artifacts
