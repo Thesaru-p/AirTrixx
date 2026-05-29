@@ -276,15 +276,17 @@ void setServoPulse(uint8_t channel, uint16_t pulse) {
 }
 
 void disableUnusedServos(uint8_t activePair) {
-  if (activePair != ACTIVE_PAIR_RIGHT && activePair != ACTIVE_PAIR_HANDS) {
+  if (activePair != ACTIVE_PAIR_RIGHT && activePair != ACTIVE_PAIR_HANDS &&
+      activePair != ACTIVE_PAIR_DOCK) {
     disableServo(CH_R_PAN);
     disableServo(CH_R_TILT);
   }
-  if (activePair != ACTIVE_PAIR_LEFT && activePair != ACTIVE_PAIR_HANDS) {
+  if (activePair != ACTIVE_PAIR_LEFT && activePair != ACTIVE_PAIR_HANDS &&
+      activePair != ACTIVE_PAIR_DOCK) {
     disableServo(CH_L_PAN);
     disableServo(CH_L_TILT);
   }
-  if (activePair != ACTIVE_PAIR_CAMERA) {
+  if (activePair != ACTIVE_PAIR_CAMERA && activePair != ACTIVE_PAIR_DOCK) {
     disableServo(CH_CAM_PAN);
     disableServo(CH_CAM_TILT);
   }
@@ -337,15 +339,19 @@ void applyServoCommand(const ServoCommandPacket &command) {
   }
 }
 
-void centerCameraBracketAtStartup() {
-  statusPrintln("[CAMDOCK] Centering camera bracket at startup...");
-  currentActivePair = ACTIVE_PAIR_CAMERA;
+void centerAllBracketsAtStartup() {
+  statusPrintln("[CAMDOCK] Centering all brackets at startup...");
+  currentActivePair = ACTIVE_PAIR_DOCK;
   setServoPulse(CH_CAM_PAN, DEFAULT_CAM_PAN_CENTER);
   setServoPulse(CH_CAM_TILT, DEFAULT_CAM_TILT_CENTER);
+  setServoPulse(CH_R_PAN, DEFAULT_R_PAN_CENTER);
+  setServoPulse(CH_R_TILT, DEFAULT_R_TILT_CENTER);
+  setServoPulse(CH_L_PAN, DEFAULT_L_PAN_CENTER);
+  setServoPulse(CH_L_TILT, DEFAULT_L_TILT_CENTER);
   delay(700);
   disableUnusedServos(ACTIVE_PAIR_NONE);
   currentActivePair = ACTIVE_PAIR_NONE;
-  statusPrintln("[CAMDOCK] Startup camera centering complete; servos disabled.");
+  statusPrintln("[CAMDOCK] Startup bracket centering complete; servos disabled.");
 }
 
 void sendCamDockData() {
@@ -456,7 +462,7 @@ void setup() {
   pwm.begin();
   pwm.setPWMFreq(50);
   delay(10);
-  centerCameraBracketAtStartup();
+  centerAllBracketsAtStartup();
 
   leftToFReady = initToFSensor(tofLeft, CH_LEFT_TOF);
   rightToFReady = initToFSensor(tofRight, CH_RIGHT_TOF);

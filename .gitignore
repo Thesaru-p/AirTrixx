@@ -11,6 +11,8 @@ python_app/data/
 
 # Firmware build artifacts
 firmware/**/.pio/
+firmware/**/compile_commands.json
+firmware/**/compile_flags.txt
 
 # Local distribution/build outputs
 .dist/

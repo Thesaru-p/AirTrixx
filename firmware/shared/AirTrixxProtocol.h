@@ -1,6 +1,5 @@
 #pragma once
 
-#include <Arduino.h>
 #include <stdint.h>
 
 #define AIRTRIXX_PROTOCOL_VERSION 1
@@ -58,7 +57,8 @@ enum AirTrixxActivePair : uint8_t {
   ACTIVE_PAIR_RIGHT  = 1,
   ACTIVE_PAIR_LEFT   = 2,
   ACTIVE_PAIR_CAMERA = 3,
-  ACTIVE_PAIR_HANDS  = 4
+  ACTIVE_PAIR_HANDS  = 4,
+  ACTIVE_PAIR_DOCK   = 5
 };
 
 enum AirTrixxServoMask : uint8_t {
@@ -217,6 +217,7 @@ inline const char *activePairToString(uint8_t active_pair) {
     case ACTIVE_PAIR_LEFT: return "left";
     case ACTIVE_PAIR_CAMERA: return "camera";
     case ACTIVE_PAIR_HANDS: return "hands";
+    case ACTIVE_PAIR_DOCK: return "dock";
     default: return "none";
   }
 }
@@ -231,6 +232,9 @@ inline uint8_t maskForActivePair(uint8_t active_pair) {
       return SERVO_MASK_CAM_PAN | SERVO_MASK_CAM_TILT;
     case ACTIVE_PAIR_HANDS:
       return SERVO_MASK_R_PAN | SERVO_MASK_R_TILT | SERVO_MASK_L_PAN | SERVO_MASK_L_TILT;
+    case ACTIVE_PAIR_DOCK:
+      return SERVO_MASK_R_PAN | SERVO_MASK_R_TILT | SERVO_MASK_L_PAN | SERVO_MASK_L_TILT |
+             SERVO_MASK_CAM_PAN | SERVO_MASK_CAM_TILT;
     default:
       return 0;
   }

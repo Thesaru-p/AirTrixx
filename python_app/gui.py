@@ -632,6 +632,10 @@ class AirTrixxGUI:
         ttk.Entry(record_box, textvariable=self.duration_var, width=10).grid(row=2, column=1, sticky="w", pady=(6, 0))
         self.record_button = ttk.Button(record_box, text="Record Gesture", command=self.record_gesture, style="Accent.TButton")
         self.record_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.gesture_progress_text_var = tk.StringVar(value="0%")
+        self.gesture_progress_label = ttk.Label(record_box, textvariable=self.gesture_progress_text_var)
+        self.gesture_progress_bar = ttk.Progressbar(record_box, maximum=100, mode="determinate")
+        self._gesture_progress_visible = False
 
     def _build_audio_dock_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Audio Dock", "Real-time Edge Impulse clap detection and Deepgram transcription inputs.")
@@ -1954,6 +1958,24 @@ class AirTrixxGUI:
             return
         self.recorder.start(self.gesture_name_var.get(), repetitions, duration_s)
 
+    def _update_gesture_recording_progress(self) -> None:
+        if self.recorder.is_recording:
+            pct = int(round(self.recorder.progress * 100))
+            self.gesture_progress_bar["value"] = pct
+            self.gesture_progress_text_var.set(f"{pct}%")
+            if not self._gesture_progress_visible:
+                self.gesture_progress_label.grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+                self.gesture_progress_bar.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+                self._gesture_progress_visible = True
+            return
+
+        if self._gesture_progress_visible:
+            self.gesture_progress_label.grid_remove()
+            self.gesture_progress_bar.grid_remove()
+            self.gesture_progress_bar["value"] = 0
+            self.gesture_progress_text_var.set("0%")
+            self._gesture_progress_visible = False
+
     def close(self) -> None:
         self._close_camera_popup()
         self._stop_ota_server()
@@ -1984,6 +2006,7 @@ class AirTrixxGUI:
 
         self.connect_button.configure(text="Disconnect" if self.serial_bridge.is_connected else "Connect")
         self.record_button.configure(text="Recording..." if self.recorder.is_recording else "Record Gesture")
+        self._update_gesture_recording_progress()
         self._update_fan_controls()
         self.root.after(33, self._tick)
 

@@ -29,10 +29,15 @@ class GestureRecorder:
         self.sample_hz = sample_hz
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._progress = 0.0
 
     @property
     def is_recording(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def progress(self) -> float:
+        return self._progress
 
     def start(self, gesture_name: str, repetitions: int, duration_s: float, countdown_s: int = 3) -> bool:
         if self.is_recording:
@@ -49,6 +54,7 @@ class GestureRecorder:
         countdown_s = max(0, int(countdown_s))
 
         self._stop_event.clear()
+        self._progress = 0.0
         self._thread = threading.Thread(
             target=self._record_worker,
             args=(clean_name, repetitions, duration_s, countdown_s),
@@ -70,11 +76,19 @@ class GestureRecorder:
         gesture_dir = self.gesture_root / gesture_name
         gesture_dir.mkdir(parents=True, exist_ok=True)
 
+        session_start = time.time()
+        total_duration = repetitions * (countdown_s + duration_s)
+
+        def update_progress() -> None:
+            elapsed = time.time() - session_start
+            self._progress = min(1.0, elapsed / max(0.001, total_duration))
+
         for rep in range(1, repetitions + 1):
             if self._stop_event.is_set():
                 break
 
             for remaining in range(countdown_s, 0, -1):
+                update_progress()
                 self._status(f"{gesture_name} rep {rep}/{repetitions}: starting in {remaining}...")
                 if self._sleep_interruptible(1.0):
                     return
@@ -87,6 +101,7 @@ class GestureRecorder:
 
             while time.time() < end and not self._stop_event.is_set():
                 now = time.time()
+                update_progress()
                 snapshot = self.snapshot_provider()
                 samples.append(
                     {
@@ -121,7 +136,9 @@ class GestureRecorder:
                 f.write("\n")
             self._status(f"Saved {output_path}")
 
+        self._progress = 1.0
         self._status("Gesture recording finished.")
+        self._progress = 0.0
 
     def _sleep_interruptible(self, seconds: float) -> bool:
         return self._stop_event.wait(max(0.0, seconds))
