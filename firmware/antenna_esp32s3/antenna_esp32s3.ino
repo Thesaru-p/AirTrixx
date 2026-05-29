@@ -879,12 +879,16 @@ void printKeyboardJson(const LatestKeyboard &snapshot, uint32_t nowMs) {
   printNullableDistanceMm(ok, snapshot.packet.valid_2, snapshot.packet.distance_mm_2);
   Serial.print(",\"sensor_3_mm\":");
   printNullableDistanceMm(ok, snapshot.packet.valid_3, snapshot.packet.distance_mm_3);
+  Serial.print(",\"sensor_4_mm\":");
+  printNullableDistanceMm(ok, snapshot.packet.valid_4, snapshot.packet.distance_mm_4);
   Serial.print("},\"valid\":{\"sensor_1\":");
   Serial.print(ok && snapshot.packet.valid_1 != 0 ? "true" : "false");
   Serial.print(",\"sensor_2\":");
   Serial.print(ok && snapshot.packet.valid_2 != 0 ? "true" : "false");
   Serial.print(",\"sensor_3\":");
   Serial.print(ok && snapshot.packet.valid_3 != 0 ? "true" : "false");
+  Serial.print(",\"sensor_4\":");
+  Serial.print(ok && snapshot.packet.valid_4 != 0 ? "true" : "false");
   Serial.print("}}");
 }
 

@@ -17,7 +17,7 @@ static const uint8_t SDA_PIN = 8;
 static const uint8_t SCL_PIN = 9;
 static const uint8_t TCA_ADDR = 0x70;
 static const uint8_t VL53L0X_ADDR = 0x29;
-static const uint8_t SENSOR_COUNT = 3;
+static const uint8_t SENSOR_COUNT = 4;
 static const uint8_t NO_CHANNEL = 0xFF;
 static const uint32_t KEYBOARD_SERIAL_BAUD = 115200;
 static const uint32_t STATUS_PRINT_INTERVAL_MS = 2000;
@@ -27,11 +27,12 @@ static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 static VL53L0X sensor0;
 static VL53L0X sensor1;
 static VL53L0X sensor2;
-static VL53L0X *tofSensors[SENSOR_COUNT] = {&sensor0, &sensor1, &sensor2};
+static VL53L0X sensor3;
+static VL53L0X *tofSensors[SENSOR_COUNT] = {&sensor0, &sensor1, &sensor2, &sensor3};
 
 static bool sensorReady[SENSOR_COUNT] = {};
 static bool distanceValid[SENSOR_COUNT] = {};
-static uint8_t sensorChannel[SENSOR_COUNT] = {NO_CHANNEL, NO_CHANNEL, NO_CHANNEL};
+static uint8_t sensorChannel[SENSOR_COUNT] = {NO_CHANNEL, NO_CHANNEL, NO_CHANNEL, NO_CHANNEL};
 static uint16_t distanceMm[SENSOR_COUNT] = {};
 static uint16_t keyboardSequence = 0;
 static uint32_t lastReportMs = 0;
@@ -256,9 +257,11 @@ void sendKeyboardTof() {
   packet.distance_mm_1 = distanceMm[0];
   packet.distance_mm_2 = distanceMm[1];
   packet.distance_mm_3 = distanceMm[2];
+  packet.distance_mm_4 = distanceMm[3];
   packet.valid_1 = distanceValid[0] ? 1 : 0;
   packet.valid_2 = distanceValid[1] ? 1 : 0;
   packet.valid_3 = distanceValid[2] ? 1 : 0;
+  packet.valid_4 = distanceValid[3] ? 1 : 0;
 
   esp_err_t result = esp_now_send(ANTENNA_MAC_PLACEHOLDER,
                                   reinterpret_cast<uint8_t *>(&packet),
@@ -305,12 +308,16 @@ void printStatus() {
   Serial.print(readOkCount[1]);
   Serial.print("/");
   Serial.print(readOkCount[2]);
+  Serial.print("/");
+  Serial.print(readOkCount[3]);
   Serial.print(", read_fail=");
   Serial.print(readFailCount[0]);
   Serial.print("/");
   Serial.print(readFailCount[1]);
   Serial.print("/");
   Serial.print(readFailCount[2]);
+  Serial.print("/");
+  Serial.print(readFailCount[3]);
   Serial.print(", send_ok/fail=");
   Serial.print(espNowSendOkCount);
   Serial.print("/");

@@ -157,9 +157,11 @@ struct AIRTRIXX_PACKED KeyboardTofPacket {
   uint16_t distance_mm_1;
   uint16_t distance_mm_2;
   uint16_t distance_mm_3;
+  uint16_t distance_mm_4;
   uint8_t valid_1;
   uint8_t valid_2;
   uint8_t valid_3;
+  uint8_t valid_4;
 };
 
 struct AIRTRIXX_PACKED AudioDockDataPacket {

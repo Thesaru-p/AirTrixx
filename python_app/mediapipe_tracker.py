@@ -265,8 +265,25 @@ class HandTracker:
                 pass
         return smoothed
 
+    def _open_camera_capture(self, preferred_index: int) -> tuple[Any | None, int | None]:
+        # Try the selected camera first, then a few common fallback indices.
+        trial_indices: list[int] = [preferred_index]
+        for fallback_index in (0, 1, 2, 3):
+            if fallback_index not in trial_indices:
+                trial_indices.append(fallback_index)
+
+        for camera_index in trial_indices:
+            cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(camera_index)
+            if cap.isOpened():
+                return cap, camera_index
+            cap.release()
+        return None, None
+
     def _run(self) -> None:
-        camera_index = self.camera_index
+        requested_camera_index = self.camera_index
         try:
             mp_hands, mp_drawing, mp_styles = _load_mediapipe_solution_modules()
         except Exception as exc:
@@ -279,11 +296,9 @@ class HandTracker:
             )
             return
 
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera_index)
-        if not cap.isOpened():
-            self._log(f"Could not open camera index {camera_index}.")
+        cap, active_camera_index = self._open_camera_capture(requested_camera_index)
+        if cap is None or active_camera_index is None:
+            self._log(f"Could not open camera index {requested_camera_index} or fallback indices 0-3.")
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -297,7 +312,10 @@ class HandTracker:
             min_detection_confidence=0.55,
             min_tracking_confidence=0.45,
         ) as hands:
-            self._log(f"MediaPipe hand tracker started on camera index {camera_index}.")
+            self._log(
+                f"MediaPipe hand tracker started on camera index {active_camera_index} "
+                f"(requested {requested_camera_index})."
+            )
             while not self._stop_event.is_set():
                 ok, frame_bgr = cap.read()
                 if not ok:

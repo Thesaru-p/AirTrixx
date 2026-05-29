@@ -14,7 +14,7 @@ from tkinter import ttk
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from config import APP_DIR, AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
@@ -32,6 +32,7 @@ SERVO_BRACKETS = {
 }
 
 CAMERA_SOURCE_INDICES = {
+    "Auto (first available)": -1,
     "USB camera": 1,
     "Built-in camera": 0,
 }
@@ -44,12 +45,17 @@ CAMERA_CENTER_TIMEOUT_S = 30.0
 CAMERA_CENTER_SETTLED_S = 0.8
 CAMERA_CENTER_COMMAND_INTERVAL_S = 0.12
 CAMERA_CENTER_MAX_STEP_TICKS = 10
+CAMERA_CENTER_FACE_LOST_GRACE_S = 0.45
 CAMERA_SEARCH_COMMAND_INTERVAL_S = 0.65
 CAMERA_SEARCH_PAN_RANGE_TICKS = 75
 CAMERA_SEARCH_PAN_STEP_TICKS = 25
 CAMERA_SEARCH_UP_DEG = 40.0
 CAMERA_SEARCH_DOWN_DEG = 25.0
 CAMERA_SEARCH_TILT_STEP_DEG = 12.0
+CAMERA_POPUP_WIDTH = 360
+CAMERA_POPUP_HEIGHT = 270
+CAMERA_POPUP_MARGIN = 18
+CAMERA_OVERLAY_MAX_LINES = 4
 SERIAL_AUTOCONNECT_DELAY_MS = 250
 SERIAL_AUTOCONNECT_RETRY_MS = 1000
 LIVE_DATA_HISTORY_ROWS = 10
@@ -215,6 +221,7 @@ class AirTrixxGUI:
         self.camera_centering_started_s: float | None = None
         self.camera_centering_settled_s: float | None = None
         self.camera_centering_last_send_s = 0.0
+        self.camera_centering_last_face_s: float | None = None
         self.camera_centering_position: dict[str, int] = {}
         self.camera_search_anchor: dict[str, int] = {}
         self.camera_search_index = 0
@@ -261,6 +268,8 @@ class AirTrixxGUI:
         self._configure_styles()
         self._build_ui()
         self.refresh_ports()
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.after(500, self._ensure_camera_popup)
         self.root.after(SERIAL_AUTOCONNECT_DELAY_MS, self.auto_connect_serial)
         self._tick()
 
@@ -466,7 +475,7 @@ class AirTrixxGUI:
         ttk.Button(controls, text="Run Camera Centering", command=self.start_camera_centering).grid(
             row=0, column=3, sticky="e", padx=(8, 0)
         )
-        ttk.Button(controls, text="Pop Out Feed", command=self.open_camera_popup).grid(
+        ttk.Button(controls, text="Show Feed", command=self.open_camera_popup).grid(
             row=0, column=4, sticky="e", padx=(8, 0)
         )
         ttk.Label(controls, textvariable=self.camera_centering_status_var).grid(
@@ -480,7 +489,7 @@ class AirTrixxGUI:
         self.preview_label.grid(row=0, column=0, sticky="w")
 
     def _build_keyboard_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Keyboard", "Three ToF lanes mapped from 0 to 300 mm in 10 mm bands.")
+        self._build_page_header(page, "Keyboard", "Four ToF lanes mapped from 0 to 300 mm in 10 mm bands.")
         body = self._scrollable_body(page)
         body.columnconfigure(0, weight=1)
 
@@ -491,13 +500,13 @@ class AirTrixxGUI:
 
         grid_box = ttk.LabelFrame(body, text="ToF Distance Grid", padding=10)
         grid_box.grid(row=1, column=0, sticky="ew")
-        for col in range(4):
+        for col in range(5):
             grid_box.columnconfigure(col, weight=1 if col > 0 else 0)
 
         header_style = {"bg": "#e7edf7", "fg": "#1f2d3d", "font": ("Segoe UI", 10, "bold")}
         cell_style = {"bg": "#f8fafc", "fg": "#1f2d3d", "font": ("Segoe UI", 10), "relief": "solid", "bd": 1}
         tk.Label(grid_box, text="Band", padx=8, pady=8, **header_style).grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
-        for col in range(3):
+        for col in range(4):
             tk.Label(grid_box, text=f"Sensor {col + 1}", padx=8, pady=8, **header_style).grid(
                 row=0, column=col + 1, sticky="nsew", padx=1, pady=1
             )
@@ -512,7 +521,7 @@ class AirTrixxGUI:
                 row=row + 1, column=0, sticky="nsew", padx=1, pady=1
             )
             cells: list[tk.Label] = []
-            for col in range(3):
+            for col in range(4):
                 label = tk.Label(grid_box, text="", width=14, padx=8, pady=7, **cell_style)
                 label.grid(row=row + 1, column=col + 1, sticky="nsew", padx=1, pady=1)
                 cells.append(label)
@@ -838,21 +847,68 @@ class AirTrixxGUI:
         return None
 
     def open_camera_popup(self) -> None:
+        self._ensure_camera_popup(lift=True)
+
+    def _ensure_camera_popup(self, lift: bool = False) -> None:
         if self.camera_popup is not None and self.camera_popup.winfo_exists():
-            self.camera_popup.lift()
+            if lift:
+                self._position_camera_popup()
+                self.camera_popup.deiconify()
+                self.camera_popup.lift()
             return
         popup = tk.Toplevel(self.root)
         popup.title("AirTrixx Camera Feed")
-        popup.geometry("960x540")
-        popup.minsize(640, 360)
-        popup.protocol("WM_DELETE_WINDOW", self._close_camera_popup)
+        popup.geometry(self._camera_popup_geometry())
+        popup.resizable(False, False)
+        popup.protocol("WM_DELETE_WINDOW", self._keep_camera_popup_visible)
         popup.configure(bg="#111827")
         popup.rowconfigure(0, weight=1)
         popup.columnconfigure(0, weight=1)
+        try:
+            popup.transient(self.root)
+            popup.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
         self.camera_popup = popup
-        self.camera_popup_label = ttk.Label(popup)
+        self.camera_popup_label = ttk.Label(popup, background="#111827")
         self.camera_popup_label.grid(row=0, column=0, sticky="nsew")
+        self._set_camera_popup_placeholder()
         self._update_preview()
+
+    def _keep_camera_popup_visible(self) -> None:
+        self._ensure_camera_popup(lift=True)
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self._position_camera_popup()
+
+    def _camera_popup_geometry(self) -> str:
+        self.root.update_idletasks()
+        root_w = max(1, self.root.winfo_width())
+        root_h = max(1, self.root.winfo_height())
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        x = root_x + max(0, root_w - CAMERA_POPUP_WIDTH - CAMERA_POPUP_MARGIN)
+        y = root_y + max(0, root_h - CAMERA_POPUP_HEIGHT - CAMERA_POPUP_MARGIN)
+        return f"{CAMERA_POPUP_WIDTH}x{CAMERA_POPUP_HEIGHT}+{x}+{y}"
+
+    def _position_camera_popup(self) -> None:
+        if self.camera_popup is None or not self.camera_popup.winfo_exists():
+            return
+        try:
+            if self.root.state() == "iconic":
+                return
+            self.camera_popup.geometry(self._camera_popup_geometry())
+        except tk.TclError:
+            pass
+
+    def _set_camera_popup_placeholder(self) -> None:
+        if self.camera_popup_label is None:
+            return
+        image = Image.new("RGB", (CAMERA_POPUP_WIDTH, CAMERA_POPUP_HEIGHT), "#111827")
+        self._draw_camera_instruction_overlay(image)
+        self._popup_photo = ImageTk.PhotoImage(image=image)
+        self.camera_popup_label.configure(image=self._popup_photo)
 
     def _close_camera_popup(self) -> None:
         if self.camera_popup is not None and self.camera_popup.winfo_exists():
@@ -1328,13 +1384,14 @@ class AirTrixxGUI:
         self.camera_centering_started_s = None
         self.camera_centering_settled_s = None
         self.camera_centering_last_send_s = 0.0
+        self.camera_centering_last_face_s = None
         self.camera_centering_position = {}
         self.camera_search_anchor = {}
         self.camera_search_index = 0
         self.camera_search_last_send_s = 0.0
         self.camera_search_found_once = False
         self._update_bracket_buttons()
-        self.camera_centering_status_var.set("Camera centering: searching for face.")
+        self.camera_centering_status_var.set("Camera centering: started; searching for face.")
         self.hand_calibration_status_var.set("Calibration phase: waiting for camera centering.")
         self.serial_autoconnect_enabled = True
         if not self.serial_bridge.is_connected:
@@ -1635,7 +1692,7 @@ class AirTrixxGUI:
         for source, index in CAMERA_SOURCE_INDICES.items():
             if index == camera_index:
                 return source
-        return "Built-in camera"
+        return "Auto (first available)"
 
     def calibrate_camera_center(self) -> None:
         if self._apply_calibration_entries() is None:
@@ -1714,7 +1771,7 @@ class AirTrixxGUI:
 
     def _set_hand_calibration_prompt(self) -> None:
         self.hand_calibration_status_var.set(
-            "Calibration phase: hold both hands in the normal start pose."
+            "Calibration phase: place both hands in neutral start pose."
         )
 
     def _best_visible_hand(self, hands: dict[str, dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]] | None:
@@ -1744,7 +1801,7 @@ class AirTrixxGUI:
         if visible_hands is None:
             self.hand_calibration_seen_since_s = None
             self.hand_calibration_status_var.set(
-                "Calibration phase: hold both hands in view at the normal start pose."
+                "Calibration phase: place both hands in view at neutral start pose."
             )
             return
 
@@ -1911,15 +1968,34 @@ class AirTrixxGUI:
             return True
 
         face = self.hand_tracker.get_latest_face()
-        if not face.get("visible"):
+        face_visible = bool(face.get("visible"))
+        previous_face_s = self.camera_centering_last_face_s
+        force_tracking_send = False
+        if not face_visible:
             self.camera_centering_settled_s = None
+            if (
+                self.camera_search_found_once
+                and previous_face_s is not None
+                and now - previous_face_s <= CAMERA_CENTER_FACE_LOST_GRACE_S
+            ):
+                self.camera_centering_status_var.set("Camera centering: reacquiring face.")
+                return True
             self._sweep_camera_for_face(now)
             return True
 
+        self.camera_centering_last_face_s = now
         if not self.camera_search_found_once:
             self.camera_search_found_once = True
             self.camera_centering_started_s = now
+            self.camera_centering_last_send_s = 0.0
+            self.camera_search_last_send_s = now
+            force_tracking_send = True
             self.log("Face detected; switching camera centering from search to tracking.")
+        elif previous_face_s is None or now - previous_face_s > CAMERA_CENTER_FACE_LOST_GRACE_S:
+            self.camera_centering_last_send_s = 0.0
+            self.camera_search_last_send_s = now
+            force_tracking_send = True
+            self.log("Face reacquired; resuming camera tracking.")
 
         face_x = (
             float(face.get("x"))
@@ -1946,7 +2022,10 @@ class AirTrixxGUI:
             return True
 
         self.camera_centering_settled_s = None
-        if now - self.camera_centering_last_send_s < CAMERA_CENTER_COMMAND_INTERVAL_S:
+        if (
+            not force_tracking_send
+            and now - self.camera_centering_last_send_s < CAMERA_CENTER_COMMAND_INTERVAL_S
+        ):
             return True
 
         x_gain = float(self.config.calibration.get("x_gain_ticks", 120))
@@ -2092,19 +2171,22 @@ class AirTrixxGUI:
         return max(-CAMERA_CENTER_MAX_STEP_TICKS, min(CAMERA_CENTER_MAX_STEP_TICKS, step))
 
     def _update_preview(self) -> None:
+        self._ensure_camera_popup()
         frame = self.hand_tracker.get_latest_frame_rgb()
         if frame is None:
+            self._set_camera_popup_placeholder()
             return
         image = Image.fromarray(frame)
         self._draw_hand_calibration_overlay(image)
+        self._draw_camera_instruction_overlay(image)
         preview_image = image.copy()
         preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
         self._photo = ImageTk.PhotoImage(image=preview_image)
         self.preview_label.configure(image=self._photo)
         if self.camera_popup is not None and self.camera_popup.winfo_exists() and self.camera_popup_label is not None:
             popup_image = image.copy()
-            width = max(640, self.camera_popup.winfo_width() - 20)
-            height = max(360, self.camera_popup.winfo_height() - 20)
+            width = max(1, self.camera_popup.winfo_width())
+            height = max(1, self.camera_popup.winfo_height())
             popup_image.thumbnail((width, height), Image.Resampling.LANCZOS)
             self._popup_photo = ImageTk.PhotoImage(image=popup_image)
             self.camera_popup_label.configure(image=self._popup_photo)
@@ -2124,6 +2206,104 @@ class AirTrixxGUI:
             outline=(70, 190, 255, 190),
             width=max(2, inset // 2),
         )
+
+    def _draw_camera_instruction_overlay(self, image: Image.Image) -> None:
+        lines = self._camera_instruction_lines()
+        if not lines:
+            return
+
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        padding = max(10, min(width, height) // 40)
+        font_size = max(20, min(34, height // 15))
+        font = self._camera_overlay_font(font_size)
+        max_text_width = width - (padding * 4)
+        wrapped_lines: list[str] = []
+        for line in lines:
+            wrapped_lines.extend(self._wrap_overlay_text(draw, line, font, max_text_width))
+        wrapped_lines = wrapped_lines[:CAMERA_OVERLAY_MAX_LINES]
+        if not wrapped_lines:
+            return
+
+        line_gap = max(4, height // 120)
+        line_sizes = [self._text_size(draw, line, font) for line in wrapped_lines]
+        line_height = max(size[1] for size in line_sizes)
+        box_height = (padding * 2) + (line_height * len(wrapped_lines)) + (line_gap * (len(wrapped_lines) - 1))
+        box_left = padding
+        box_right = width - padding
+        box_bottom = height - padding
+        box_top = max(padding, box_bottom - box_height)
+        draw.rectangle((box_left, box_top, box_right, box_bottom), fill=(17, 24, 39, 215))
+        draw.rectangle((box_left, box_top, box_left + max(4, padding // 3), box_bottom), fill=(37, 99, 235, 235))
+
+        text_x = box_left + padding
+        text_y = box_top + padding
+        for index, line in enumerate(wrapped_lines):
+            fill = (255, 255, 255, 255) if index == 0 else (229, 231, 235, 255)
+            draw.text(
+                (text_x, text_y),
+                line,
+                font=font,
+                fill=fill,
+                stroke_width=1,
+                stroke_fill=(0, 0, 0, 180),
+            )
+            text_y += line_height + line_gap
+
+    def _camera_instruction_lines(self) -> list[str]:
+        lines: list[str] = []
+
+        def add(value: str) -> None:
+            text = " ".join(value.split())
+            if text and text not in lines:
+                lines.append(text)
+
+        camera_status = self.camera_centering_status_var.get()
+        calibration_status = self.hand_calibration_status_var.get()
+        if self.camera_centering_active:
+            add(camera_status)
+        if self.hand_calibration_active or self.startup_hand_calibration_pending:
+            add(calibration_status)
+        if not lines:
+            add(camera_status)
+            add(calibration_status)
+        return lines
+
+    @staticmethod
+    def _camera_overlay_font(size: int) -> Any:
+        for font_name in ("arialbd.ttf", "arial.ttf"):
+            try:
+                return ImageFont.truetype(font_name, size=size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _wrap_overlay_text(
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: Any,
+        max_width: int,
+    ) -> list[str]:
+        words = text.split()
+        if not words:
+            return []
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if AirTrixxGUI._text_size(draw, candidate, font)[0] <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    @staticmethod
+    def _text_size(draw: ImageDraw.ImageDraw, text: str, font: Any) -> tuple[int, int]:
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
     def _update_text_views(self) -> None:
         serial_state = self.serial_bridge.get_latest_state()
@@ -2184,7 +2364,7 @@ class AirTrixxGUI:
                 cell.configure(bg=inactive_bg, fg=inactive_fg, text="")
 
         distance_text: list[str] = []
-        for index in range(3):
+        for index in range(4):
             sensor_key = f"sensor_{index + 1}"
             distance = tof.get(f"{sensor_key}_mm") if isinstance(tof, dict) else None
             is_valid = bool(valid.get(sensor_key)) if isinstance(valid, dict) else distance is not None
@@ -2253,7 +2433,7 @@ class AirTrixxGUI:
 
         add("Keyboard", "status", keyboard.get("status") if isinstance(keyboard, dict) else None)
         add("Keyboard", "sequence", keyboard.get("sequence") if isinstance(keyboard, dict) else None)
-        for sensor_index in range(1, 4):
+        for sensor_index in range(1, 5):
             add("Keyboard", f"sensor_{sensor_index}_mm", keyboard_tof.get(f"sensor_{sensor_index}_mm") if isinstance(keyboard_tof, dict) else None)
             add("Keyboard", f"sensor_{sensor_index}_valid", keyboard_valid.get(f"sensor_{sensor_index}") if isinstance(keyboard_valid, dict) else None)
 
