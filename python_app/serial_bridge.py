@@ -35,6 +35,7 @@ class SerialBridge:
         self._stop_event = threading.Event()
         self._manual_disconnect = False
         self._current_port: str | None = None
+        self.audio_dock_bridge = None
 
     @staticmethod
     def available_ports() -> list[dict[str, str]]:
@@ -171,7 +172,40 @@ class SerialBridge:
                 line = raw.decode("utf-8", errors="replace").strip()
             except Exception:
                 continue
-            if not line:
+            if line.startswith("ANTENNA_"):
+                self._log(f"[Antenna] {line}")
+                continue
+
+            is_audiodock = (
+                "AUDIODOCK_" in line or 
+                "UDIODOCK_" in line or 
+                "DOCK_AUDIO" in line or 
+                "_AUDIO:" in line or
+                (self.audio_dock_bridge and self.audio_dock_bridge.expected_audio_size is not None and len(line) > 100)
+            )
+
+            if is_audiodock:
+                first_idx = len(line)
+                for p in ["AUDIODOCK_", "UDIODOCK_", "DOCK_AUDIO", "_AUDIO:"]:
+                    idx = line.find(p)
+                    if 0 <= idx < first_idx:
+                        first_idx = idx
+                
+                if first_idx < len(line) and first_idx > 0:
+                    leading = line[:first_idx].strip()
+                    if leading:
+                        try:
+                            state = json.loads(leading)
+                            if isinstance(state, dict):
+                                with self._latest_lock:
+                                    self._latest_state = state
+                                if self.on_state:
+                                    self.on_state(copy.deepcopy(state))
+                        except Exception:
+                            pass
+                
+                if self.audio_dock_bridge:
+                    self.audio_dock_bridge.handle_antenna_line(line)
                 continue
 
             try:

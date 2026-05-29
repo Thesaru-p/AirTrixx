@@ -32,7 +32,10 @@ enum AirTrixxMessageType : uint8_t {
   MSG_FAN_STATUS     = 8,
   MSG_FAN_COMMAND    = 9,
   MSG_OTA_CHUNK      = 10,
-  MSG_KEYBOARD_TOF   = 11
+  MSG_KEYBOARD_TOF   = 11,
+  MSG_AUDIODOCK_DATA = 12,
+  MSG_AUDIODOCK_AUDIO_CHUNK = 13,
+  MSG_AUDIODOCK_TRANSCRIPT = 14
 };
 
 static const uint8_t AIRTRIXX_OTA_SSID_MAX = 32;
@@ -159,6 +162,25 @@ struct AIRTRIXX_PACKED KeyboardTofPacket {
   uint8_t valid_2;
   uint8_t valid_3;
   uint8_t valid_4;
+};
+
+struct AIRTRIXX_PACKED AudioDockDataPacket {
+  AirTrixxPacketHeader header;
+  uint8_t clap_detected;
+  uint8_t clap_type;     // 1 = Single, 2 = Double
+  uint32_t audio_size;
+};
+
+struct AIRTRIXX_PACKED AudioDockChunkPacket {
+  AirTrixxPacketHeader header;
+  uint32_t chunk_index;
+  uint16_t chunk_len;
+  uint8_t data[200];
+};
+
+struct AIRTRIXX_PACKED AudioDockTranscriptPacket {
+  AirTrixxPacketHeader header;
+  char transcript[128];
 };
 
 struct AIRTRIXX_PACKED HeartbeatPacket {
