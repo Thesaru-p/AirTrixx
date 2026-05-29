@@ -44,6 +44,8 @@ CAMERA_CENTER_DEADBAND_Y = 0.045
 CAMERA_CENTER_TIMEOUT_S = 30.0
 CAMERA_CENTER_SETTLED_S = 0.8
 CAMERA_CENTER_COMMAND_INTERVAL_S = 0.12
+CAMERA_CENTER_PAN_GAIN_TICKS = 42.0
+CAMERA_CENTER_TILT_GAIN_TICKS = 32.0
 CAMERA_CENTER_MAX_STEP_TICKS = 10
 CAMERA_CENTER_FACE_LOST_GRACE_S = 0.45
 CAMERA_SEARCH_COMMAND_INTERVAL_S = 0.65
@@ -226,7 +228,9 @@ class AirTrixxGUI:
         self.camera_search_anchor: dict[str, int] = {}
         self.camera_search_index = 0
         self.camera_search_last_send_s = 0.0
-        self.camera_search_found_once = False
+        self.camera_face_position_ok = False
+        self.camera_face_align_settled_s: float | None = None
+        self.startup_brackets_homed = False
         self.startup_hand_calibration_pending = True
         self.hand_calibration_active = False
         self.hand_calibration_index = 0
@@ -236,6 +240,7 @@ class AirTrixxGUI:
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s: float | None = None
         self.hand_calibration_auto_capture = True
+        self._calibration_last_trackable_hands: dict[str, dict[str, Any]] = {}
 
         # Initialize Audio Dock variables and instance
         self.audio_dock_status_var = tk.StringVar(value="Disconnected")
@@ -940,6 +945,7 @@ class AirTrixxGUI:
         selected = self.port_var.get().split(" - ", 1)[0].strip() or None
         if selected and self.serial_bridge.connect(selected):
             self.log(f"Auto-connected Antenna serial on {selected}.")
+            self._home_brackets_on_connect()
             return
         self.root.after(SERIAL_AUTOCONNECT_RETRY_MS, self.auto_connect_serial)
 
@@ -950,7 +956,8 @@ class AirTrixxGUI:
             return
         self.serial_autoconnect_enabled = True
         selected = self.port_var.get().split(" - ", 1)[0].strip() or None
-        self.serial_bridge.connect(selected)
+        if self.serial_bridge.connect(selected):
+            self._home_brackets_on_connect()
 
     def start_wristband_wireless_flash(self) -> None:
         if self.ota_in_progress:
@@ -1389,7 +1396,8 @@ class AirTrixxGUI:
         self.camera_search_anchor = {}
         self.camera_search_index = 0
         self.camera_search_last_send_s = 0.0
-        self.camera_search_found_once = False
+        self.camera_face_position_ok = False
+        self.camera_face_align_settled_s = None
         self._update_bracket_buttons()
         self.camera_centering_status_var.set("Camera centering: started; searching for face.")
         self.hand_calibration_status_var.set("Calibration phase: waiting for camera centering.")
@@ -1732,6 +1740,8 @@ class AirTrixxGUI:
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = bool(auto)
+        self._calibration_last_trackable_hands = {}
+        self._lock_camera_bracket_position()
         self._set_hand_calibration_prompt()
         self.serial_autoconnect_enabled = True
         if not self.serial_bridge.is_connected:
@@ -1764,6 +1774,7 @@ class AirTrixxGUI:
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = True
+        self._calibration_last_trackable_hands = {}
         self.hand_calibration_status_var.set(
             "Calibration phase: skipped; using saved dock geometry values."
         )
@@ -1797,15 +1808,30 @@ class AirTrixxGUI:
             self.hand_calibration_status_var.set("Calibration phase: waiting for Antenna serial link.")
             return
 
+        trackable_hands = self._trackable_calibration_hands(hands)
+        if trackable_hands:
+            self._calibration_last_trackable_hands = trackable_hands
+            self.servo_controller.send_for_hands(trackable_hands, serial_state, force=True)
+        elif self._calibration_last_trackable_hands:
+            self.servo_controller.send_for_hands(
+                self._calibration_last_trackable_hands,
+                serial_state,
+                force=True,
+            )
+
         visible_hands = self._visible_session_calibration_hands(hands)
         if visible_hands is None:
             self.hand_calibration_seen_since_s = None
-            self.hand_calibration_status_var.set(
-                "Calibration phase: place both hands in view at neutral start pose."
-            )
+            if trackable_hands:
+                visible_sides = ", ".join(sorted(trackable_hands.keys()))
+                self.hand_calibration_status_var.set(
+                    f"Calibration phase: tracking {visible_sides} hand(s); show both hands in neutral pose."
+                )
+            else:
+                self.hand_calibration_status_var.set(
+                    "Calibration phase: place both hands in view at neutral start pose."
+                )
             return
-
-        self.servo_controller.send_for_hands(visible_hands, serial_state, force=True)
 
         if not self.hand_calibration_auto_capture:
             self.hand_calibration_seen_since_s = None
@@ -1836,19 +1862,28 @@ class AirTrixxGUI:
             x = 1.0 - x
         return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
 
+    def _trackable_calibration_hands(
+        self,
+        hands: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        trackable: dict[str, dict[str, Any]] = {}
+        for side in ("right", "left"):
+            values = hands.get(side, {}) if isinstance(hands, dict) else {}
+            if not values.get("visible") or values.get("x") is None or values.get("y") is None:
+                continue
+            if float(values.get("score") or 0.0) < SESSION_CALIBRATION_MIN_SCORE:
+                continue
+            trackable[side] = dict(values)
+        return trackable
+
     def _visible_session_calibration_hands(
         self,
         hands: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]] | None:
-        visible: dict[str, dict[str, Any]] = {}
-        for side in ("right", "left"):
-            values = hands.get(side, {}) if isinstance(hands, dict) else {}
-            if not values.get("visible") or values.get("x") is None or values.get("y") is None:
-                return None
-            if float(values.get("score") or 0.0) < SESSION_CALIBRATION_MIN_SCORE:
-                return None
-            visible[side] = dict(values)
-        return visible
+        trackable = self._trackable_calibration_hands(hands)
+        if set(trackable.keys()) != {"right", "left"}:
+            return None
+        return trackable
 
     def _finish_session_calibration(
         self,
@@ -1889,6 +1924,7 @@ class AirTrixxGUI:
         self.hand_calibration_fist_side = None
         self.hand_calibration_target_inside = False
         self.hand_calibration_seen_since_s = None
+        self._calibration_last_trackable_hands = {}
         self.hand_calibration_status_var.set(
             "Calibration phase: saved neutral hand pose and starting distance."
         )
@@ -1951,6 +1987,19 @@ class AirTrixxGUI:
         self._update_fan_controls()
         self.root.after(33, self._tick)
 
+    def _home_brackets_on_connect(self) -> None:
+        if self.startup_brackets_homed:
+            return
+        if not self.serial_bridge.is_connected:
+            return
+        if self.servo_controller.center_all_brackets():
+            self.startup_brackets_homed = True
+            self.camera_centering_position = self._current_center_ticks("camera")
+            self.camera_search_anchor = dict(self.camera_centering_position)
+            self.log("Homed camera and ToF brackets to calibration center.")
+        else:
+            self.log("Bracket homing command failed; serial may not be ready.")
+
     def _update_camera_centering(self) -> bool:
         if not self.serial_bridge.is_connected:
             self.camera_centering_status_var.set("Camera centering: waiting for Antenna serial link.")
@@ -1960,7 +2009,7 @@ class AirTrixxGUI:
         self._ensure_camera_centering_started(now)
 
         if (
-            self.camera_search_found_once
+            not self.camera_face_position_ok
             and self.camera_centering_started_s is not None
             and now - self.camera_centering_started_s > CAMERA_CENTER_TIMEOUT_S
         ):
@@ -1969,92 +2018,107 @@ class AirTrixxGUI:
 
         face = self.hand_tracker.get_latest_face()
         face_visible = bool(face.get("visible"))
-        previous_face_s = self.camera_centering_last_face_s
-        force_tracking_send = False
         if not face_visible:
+            self.camera_face_align_settled_s = None
             self.camera_centering_settled_s = None
-            if (
-                self.camera_search_found_once
-                and previous_face_s is not None
-                and now - previous_face_s <= CAMERA_CENTER_FACE_LOST_GRACE_S
-            ):
-                self.camera_centering_status_var.set("Camera centering: reacquiring face.")
+            if self.camera_face_position_ok:
+                self.camera_centering_status_var.set(
+                    "Camera centering: face identified; waiting for face to return."
+                )
                 return True
             self._sweep_camera_for_face(now)
             return True
 
         self.camera_centering_last_face_s = now
-        if not self.camera_search_found_once:
-            self.camera_search_found_once = True
-            self.camera_centering_started_s = now
-            self.camera_centering_last_send_s = 0.0
-            self.camera_search_last_send_s = now
-            force_tracking_send = True
-            self.log("Face detected; switching camera centering from search to tracking.")
-        elif previous_face_s is None or now - previous_face_s > CAMERA_CENTER_FACE_LOST_GRACE_S:
-            self.camera_centering_last_send_s = 0.0
-            self.camera_search_last_send_s = now
-            force_tracking_send = True
-            self.log("Face reacquired; resuming camera tracking.")
+        if not self.camera_face_position_ok:
+            if not self.camera_centering_position:
+                self.camera_centering_position = self._current_center_ticks("camera")
+            aligned = self._align_camera_to_face_target(face, now)
+            if aligned:
+                if self.camera_face_align_settled_s is None:
+                    self.camera_face_align_settled_s = now
+                elif now - self.camera_face_align_settled_s >= CAMERA_CENTER_SETTLED_S:
+                    self.camera_face_position_ok = True
+                    self.camera_centering_settled_s = now
+                    self.servo_controller.send_camera_with_parallel_tof(
+                        self.camera_centering_position["pan"],
+                        self.camera_centering_position["tilt"],
+                    )
+                    self.log(
+                        "Face centered at guide position; camera and ToF locked in parallel."
+                    )
+            else:
+                self.camera_face_align_settled_s = None
+            return True
 
-        face_x = (
-            float(face.get("x"))
-            if face.get("x") is not None
-            else CAMERA_CENTER_TARGET_X
+        if self.camera_centering_settled_s is None:
+            self.camera_centering_settled_s = now
+        held_s = now - self.camera_centering_settled_s
+        if held_s >= CAMERA_CENTER_SETTLED_S:
+            self._complete_camera_centering("face_found")
+            return False
+        self.camera_centering_status_var.set(
+            f"Camera centering: face at guide position; starting calibration in "
+            f"{max(0.0, CAMERA_CENTER_SETTLED_S - held_s):.1f}s."
         )
-        face_top_y = (
-            float(face.get("top_y"))
-            if face.get("top_y") is not None
-            else CAMERA_CENTER_TARGET_FACE_TOP_Y
-        )
+        return True
+
+    def _align_camera_to_face_target(self, face: dict[str, Any], now: float) -> bool:
+        if now - self.camera_centering_last_send_s < CAMERA_CENTER_COMMAND_INTERVAL_S:
+            return self._face_within_center_target(face)
+
+        face_x = float(face.get("x") or 0.5)
+        face_top_y = float(face.get("top_y") or face.get("y") or 0.5)
         error_x = face_x - CAMERA_CENTER_TARGET_X
         error_y = face_top_y - CAMERA_CENTER_TARGET_FACE_TOP_Y
-        x_ready = abs(error_x) <= CAMERA_CENTER_DEADBAND_X
-        y_ready = abs(error_y) <= CAMERA_CENTER_DEADBAND_Y
-
-        if x_ready and y_ready:
-            if self.camera_centering_settled_s is None:
-                self.camera_centering_settled_s = now
-            if now - self.camera_centering_settled_s >= CAMERA_CENTER_SETTLED_S:
-                self._complete_camera_centering("centered")
-                return False
-            self.camera_centering_status_var.set("Camera centering: holding target.")
-            return True
-
-        self.camera_centering_settled_s = None
-        if (
-            not force_tracking_send
-            and now - self.camera_centering_last_send_s < CAMERA_CENTER_COMMAND_INTERVAL_S
-        ):
-            return True
-
-        x_gain = float(self.config.calibration.get("x_gain_ticks", 120))
-        y_gain = float(self.config.calibration.get("y_gain_ticks", 90))
-        pan_delta = self._bounded_camera_step(-error_x * x_gain * 0.35)
-        tilt_delta = self._bounded_camera_step(error_y * y_gain * 0.35)
-        if not x_ready:
-            self.camera_centering_position["pan"] = self._clamp_servo_tick(
-                self.camera_centering_position["pan"] + pan_delta
-            )
-        if not y_ready:
-            self.camera_centering_position["tilt"] = self._clamp_servo_tick(
-                self.camera_centering_position["tilt"] + tilt_delta
-            )
-
-        sent = self.servo_controller.send_bracket_position(
-            "camera",
-            self.camera_centering_position["pan"],
-            self.camera_centering_position["tilt"],
+        within_target = (
+            abs(error_x) <= CAMERA_CENTER_DEADBAND_X
+            and abs(error_y) <= CAMERA_CENTER_DEADBAND_Y
         )
-        self.camera_centering_last_send_s = now
-        if sent:
-            self.camera_centering_status_var.set(
-                "Camera centering: pan "
-                f"{self.camera_centering_position['pan']}, tilt {self.camera_centering_position['tilt']}."
+
+        if not within_target:
+            position = dict(self.camera_centering_position)
+            if "pan" not in position or "tilt" not in position:
+                position = self._current_center_ticks("camera")
+            if abs(error_x) > CAMERA_CENTER_DEADBAND_X:
+                position["pan"] = self._clamp_servo_tick(
+                    int(position["pan"])
+                    + self._bounded_camera_step(-error_x * CAMERA_CENTER_PAN_GAIN_TICKS)
+                )
+            if abs(error_y) > CAMERA_CENTER_DEADBAND_Y:
+                position["tilt"] = self._clamp_servo_tick(
+                    int(position["tilt"])
+                    + self._bounded_camera_step(error_y * CAMERA_CENTER_TILT_GAIN_TICKS)
+                )
+            self.camera_centering_position = position
+            self.servo_controller.send_camera_with_parallel_tof(
+                position["pan"],
+                position["tilt"],
             )
-        else:
-            self.camera_centering_status_var.set("Camera centering: serial write failed.")
+            self.camera_centering_last_send_s = now
+            self.camera_search_last_send_s = now
+            self.camera_centering_status_var.set(
+                "Camera centering: aligning face to guide (camera + ToF parallel), pan "
+                f"{position['pan']}, tilt {position['tilt']}."
+            )
+            return False
+
+        self.camera_centering_status_var.set(
+            "Camera centering: face at guide position; holding steady."
+        )
         return True
+
+    @staticmethod
+    def _face_within_center_target(face: dict[str, Any]) -> bool:
+        try:
+            face_x = float(face.get("x"))
+            face_top_y = float(face.get("top_y") if face.get("top_y") is not None else face.get("y"))
+        except (TypeError, ValueError):
+            return False
+        return (
+            abs(face_x - CAMERA_CENTER_TARGET_X) <= CAMERA_CENTER_DEADBAND_X
+            and abs(face_top_y - CAMERA_CENTER_TARGET_FACE_TOP_Y) <= CAMERA_CENTER_DEADBAND_Y
+        )
 
     def _ensure_camera_centering_started(self, now: float) -> None:
         if self.camera_centering_started_s is not None:
@@ -2062,6 +2126,12 @@ class AirTrixxGUI:
         self.camera_centering_started_s = now
         self.camera_centering_position = self._current_center_ticks("camera")
         self.camera_search_anchor = dict(self.camera_centering_position)
+        self.camera_search_last_send_s = 0.0
+        if self.serial_bridge.is_connected:
+            self.servo_controller.send_camera_with_parallel_tof(
+                self.camera_centering_position["pan"],
+                self.camera_centering_position["tilt"],
+            )
         self.log("Camera centering started.")
 
     def _sweep_camera_for_face(self, now: float) -> None:
@@ -2079,8 +2149,7 @@ class AirTrixxGUI:
             "pan": self._clamp_servo_tick(self.camera_search_anchor["pan"] + pan_offset),
             "tilt": self._clamp_servo_tick(self.camera_search_anchor["tilt"] + tilt_offset),
         }
-        sent = self.servo_controller.send_bracket_position(
-            "camera",
+        sent = self.servo_controller.send_camera_with_parallel_tof(
             self.camera_centering_position["pan"],
             self.camera_centering_position["tilt"],
         )
@@ -2088,7 +2157,7 @@ class AirTrixxGUI:
         self.camera_centering_last_send_s = now
         if sent:
             self.camera_centering_status_var.set(
-                "Camera centering: searching for face, pan "
+                "Camera centering: searching for face (camera + ToF parallel), pan "
                 f"{self.camera_centering_position['pan']}, tilt "
                 f"{self.camera_centering_position['tilt']}."
             )
@@ -2156,10 +2225,27 @@ class AirTrixxGUI:
 
     def _complete_camera_centering(self, reason: str) -> None:
         self.camera_centering_active = False
-        self.camera_centering_status_var.set(f"Camera centering: {reason}.")
+        if reason == "face_found":
+            status = "face centered at guide; camera locked"
+        elif reason == "centered":
+            status = "centered"
+        else:
+            status = reason
+        self.camera_centering_status_var.set(f"Camera centering: {status}.")
         self.log(f"Camera centering finished: {reason}.")
-        if reason == "centered" and self.startup_hand_calibration_pending:
+        if reason in ("centered", "face_found") and self.startup_hand_calibration_pending:
             self.start_hand_calibration(auto=True)
+
+    def _lock_camera_bracket_position(self) -> None:
+        if not self.serial_bridge.is_connected:
+            return
+        position = self.camera_centering_position
+        if isinstance(position, dict) and "pan" in position and "tilt" in position:
+            pan = int(position["pan"])
+            tilt = int(position["tilt"])
+        else:
+            pan, tilt = self.servo_controller.center_ticks_for_bracket("camera")
+        self.servo_controller.send_camera_with_parallel_tof(pan, tilt)
 
     @staticmethod
     def _bounded_camera_step(value: float) -> int:
@@ -2178,6 +2264,7 @@ class AirTrixxGUI:
             return
         image = Image.fromarray(frame)
         self._draw_hand_calibration_overlay(image)
+        self._draw_face_centering_guide(image)
         self._draw_camera_instruction_overlay(image)
         preview_image = image.copy()
         preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
@@ -2194,6 +2281,23 @@ class AirTrixxGUI:
             self.camera_popup = None
             self.camera_popup_label = None
             self._popup_photo = None
+
+    def _draw_face_centering_guide(self, image: Image.Image) -> None:
+        if not self.camera_centering_active:
+            return
+        draw = ImageDraw.Draw(image, "RGBA")
+        width, height = image.size
+        target_x = CAMERA_CENTER_TARGET_X
+        if self.hand_tracker.mirror_preview:
+            target_x = 1.0 - target_x
+        cx = int(target_x * width)
+        top_y = int(CAMERA_CENTER_TARGET_FACE_TOP_Y * height)
+        head_h = max(24, height // 5)
+        head_w = max(32, width // 6)
+        box = (cx - head_w // 2, top_y, cx + head_w // 2, top_y + head_h)
+        draw.rectangle(box, outline=(60, 220, 120, 220), width=max(2, width // 240))
+        draw.line((cx - 18, top_y + head_h // 2, cx + 18, top_y + head_h // 2), fill=(60, 220, 120, 180), width=2)
+        draw.line((cx, top_y - 8, cx, top_y + head_h + 8), fill=(60, 220, 120, 180), width=2)
 
     def _draw_hand_calibration_overlay(self, image: Image.Image) -> None:
         if not self.hand_calibration_active:
