@@ -27,7 +27,7 @@ class ServoController:
         calibration: dict[str, Any],
         servo_min_tick: int = 0,
         servo_max_tick: int = 4095,
-        max_command_hz: float = 30.0,
+        max_command_hz: float = 40.0,
         camera_width: int = 640,
         camera_height: int = 480,
         horizontal_fov_deg: float = 70.0,
@@ -87,7 +87,7 @@ class ServoController:
             self._smoothed.clear()
             self._hand_history.clear()
 
-        sent = self._send(active_pair, servos)
+        sent = self._send(active_pair, servos, disable_unused=False)
         debug["active_pair"] = active_pair
         debug["sent"] = sent
         debug["servos"] = {name: int(servos.get(name, 0)) for name in SERVO_FIELDS}
@@ -118,6 +118,59 @@ class ServoController:
             self._clamp_tick(int(self.calibration.get(pan_key, 307))),
             self._clamp_tick(int(self.calibration.get(tilt_key, 307))),
         )
+
+    def parallel_hand_ticks_from_camera(self, cam_pan: int, cam_tilt: int) -> tuple[int, int, int, int]:
+        cam_center_pan, cam_center_tilt = self.center_ticks_for_bracket("camera")
+        pan_delta = int(cam_pan) - cam_center_pan
+        tilt_delta = int(cam_tilt) - cam_center_tilt
+        r_center_pan, r_center_tilt = self.center_ticks_for_bracket("right")
+        l_center_pan, l_center_tilt = self.center_ticks_for_bracket("left")
+        return (
+            self._clamp_tick(r_center_pan + pan_delta),
+            self._clamp_tick(r_center_tilt + tilt_delta),
+            self._clamp_tick(l_center_pan + pan_delta),
+            self._clamp_tick(l_center_tilt + tilt_delta),
+        )
+
+    def center_all_brackets(self) -> bool:
+        cam_pan, cam_tilt = self.center_ticks_for_bracket("camera")
+        return self.send_camera_with_parallel_tof(cam_pan, cam_tilt)
+
+    def send_camera_with_parallel_tof(self, cam_pan: int, cam_tilt: int) -> bool:
+        """Move camera and both ToF brackets with the same pan/tilt offset from center."""
+        cam_pan = self._clamp_tick(cam_pan)
+        cam_tilt = self._clamp_tick(cam_tilt)
+        r_pan, r_tilt, l_pan, l_tilt = self.parallel_hand_ticks_from_camera(cam_pan, cam_tilt)
+
+        zero = {name: 0 for name in SERVO_FIELDS}
+        cam_servos = dict(zero)
+        cam_servos["cam_pan"] = cam_pan
+        cam_servos["cam_tilt"] = cam_tilt
+        right_servos = dict(zero)
+        right_servos["r_pan"] = r_pan
+        right_servos["r_tilt"] = r_tilt
+        left_servos = dict(zero)
+        left_servos["l_pan"] = l_pan
+        left_servos["l_tilt"] = l_tilt
+
+        all_servos = dict(zero)
+        all_servos.update(cam_servos)
+        all_servos.update(right_servos)
+        all_servos.update(left_servos)
+
+        # Single "dock" command only when Cam Dock firmware supports ACTIVE_PAIR_DOCK.
+        if bool(self.calibration.get("use_dock_servo_pair", False)):
+            sent = self._send("dock", all_servos, disable_unused=True)
+        else:
+            # Legacy path: three commands without disabling other brackets between steps.
+            sent = self._send("camera", cam_servos, disable_unused=False)
+            sent = self._send("right", right_servos, disable_unused=False) and sent
+            sent = self._send("left", left_servos, disable_unused=False) and sent
+
+        if sent:
+            self._last_send_time = time.monotonic()
+            self._record_bracket_ticks("dock", all_servos, source="parallel", auto=False)
+        return sent
 
     def send_bracket_position(self, bracket: str, pan_tick: int, tilt_tick: int) -> bool:
         if bracket not in BRACKET_SERVO_FIELDS:
@@ -247,8 +300,8 @@ class ServoController:
 
         pan_target = pan_center + pan_sign * (yaw_deg + pan_offset_deg) * pan_ticks_per_deg
         tilt_target = tilt_center + tilt_sign * (pitch_deg + tilt_offset_deg) * tilt_ticks_per_deg
-        pan_tick = self._smooth_and_clamp(f"{prefix}_pan", pan_target)
-        tilt_tick = self._smooth_and_clamp(f"{prefix}_tilt", tilt_target)
+        pan_tick = self._smooth_and_clamp_hand(f"{prefix}_pan", pan_target)
+        tilt_tick = self._smooth_and_clamp_hand(f"{prefix}_tilt", tilt_target)
         return pan_tick, tilt_tick, {
             "distance_mm": distance_mm,
             "ray": ray,
@@ -457,14 +510,22 @@ class ServoController:
         predicted_y = y + ((y - previous_y) / dt) * latency_s
         return max(0.0, min(1.0, predicted_x)), max(0.0, min(1.0, predicted_y))
 
-    def _send(self, active_pair: str, servos: dict[str, int]) -> bool:
-        command = {
+    def _send(
+        self,
+        active_pair: str,
+        servos: dict[str, int],
+        *,
+        disable_unused: bool = True,
+    ) -> bool:
+        servo_values = {name: int(servos.get(name, 0)) for name in SERVO_FIELDS}
+        command: dict[str, Any] = {
             "cmd": "servo",
             "target": "camdock",
             "active_pair": active_pair,
-            "disable_unused": True,
-            "servos": {name: int(servos.get(name, 0)) for name in SERVO_FIELDS},
+            "disable_unused": disable_unused,
+            "servos": servo_values,
         }
+        command.update(servo_values)
         return self.serial_bridge.send_command(command)
 
     def _next_debug_sequence(self) -> int:
@@ -502,9 +563,28 @@ class ServoController:
         target = center + offset
         return self._smooth_and_clamp(servo_name, target)
 
-    def _smooth_and_clamp(self, servo_name: str, target: float) -> int:
-        deadband = float(self.calibration.get("deadband", 4))
-        alpha = float(self.calibration.get("smoothing_alpha", 0.35))
+    def _smooth_and_clamp_hand(self, servo_name: str, target: float) -> int:
+        deadband = self._calib_float("hand_servo_deadband", 2.0)
+        alpha = self._calib_float("hand_servo_smoothing_alpha", 0.62)
+        return self._smooth_and_clamp(
+            servo_name,
+            target,
+            deadband=deadband,
+            alpha=alpha,
+        )
+
+    def _smooth_and_clamp(
+        self,
+        servo_name: str,
+        target: float,
+        *,
+        deadband: float | None = None,
+        alpha: float | None = None,
+    ) -> int:
+        if deadband is None:
+            deadband = float(self.calibration.get("deadband", 4))
+        if alpha is None:
+            alpha = float(self.calibration.get("smoothing_alpha", 0.35))
         alpha = max(0.0, min(1.0, alpha))
         previous = self._smoothed.get(servo_name)
         if previous is None:
@@ -565,6 +645,8 @@ class ServoController:
     def _brackets_for_active_pair(active_pair: str) -> tuple[str, ...]:
         if active_pair == "hands":
             return "right", "left"
+        if active_pair == "dock":
+            return ("camera", "right", "left")
         if active_pair in BRACKET_SERVO_FIELDS:
             return (active_pair,)
         return ()

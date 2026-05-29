@@ -138,6 +138,9 @@ uint8_t parseActivePair(const String &value) {
   if (value == "hands" || value == "both") {
     return ACTIVE_PAIR_HANDS;
   }
+  if (value == "dock") {
+    return ACTIVE_PAIR_DOCK;
+  }
   return ACTIVE_PAIR_NONE;
 }
 

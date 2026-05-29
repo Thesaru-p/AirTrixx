@@ -1,0 +1,23 @@
+CompileFlags:
+  Add:
+    - -Ifirmware/shared
+
+---
+If:
+  PathMatch: firmware/antenna_esp32s3/.*
+CompileFlags:
+  CompilationDatabase: firmware/antenna_esp32s3
+
+---
+If:
+  PathMatch: firmware/camdock_esp32s3/.*
+CompileFlags:
+  CompilationDatabase: firmware/camdock_esp32s3
+
+---
+If:
+  PathMatch: .*\.ino$
+Diagnostics:
+  Suppress: '*'
+Index:
+  Background: Skip
