@@ -1,5 +1,5 @@
 opencv-contrib-python>=4.9
-mediapipe==0.10.35
+mediapipe==0.10.9
 pyserial>=3.5
 numpy>=1.24,<2
 pillow>=10

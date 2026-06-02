@@ -45,7 +45,9 @@ class ServoController:
         self._last_send_time = 0.0
         self._smoothed: dict[str, float] = {}
         self._hand_history: dict[str, tuple[float, float, float]] = {}
+        self._last_raw_tof_mm: dict[str, float] = {}
         self._last_distance_mm: dict[str, float] = {}
+        self._last_distance_debug: dict[str, dict[str, Any]] = {}
         self._debug_sequence = 0
         self.last_debug_snapshot: dict[str, Any] = {}
         self._last_auto_bracket_ticks: dict[str, dict[str, Any]] = {}
@@ -55,7 +57,9 @@ class ServoController:
         self.calibration = dict(calibration)
         self._smoothed.clear()
         self._hand_history.clear()
+        self._last_raw_tof_mm.clear()
         self._last_distance_mm.clear()
+        self._last_distance_debug.clear()
 
     def send_for_hands(
         self,
@@ -104,6 +108,8 @@ class ServoController:
         sent = self._send("camera", servos)
         if sent or force:
             self._last_send_time = time.monotonic()
+        if sent:
+            self._record_bracket_ticks("camera", servos, source="center", auto=False)
         return sent
 
     def center_bracket(self, bracket: str) -> bool:
@@ -118,6 +124,16 @@ class ServoController:
             self._clamp_tick(int(self.calibration.get(pan_key, 307))),
             self._clamp_tick(int(self.calibration.get(tilt_key, 307))),
         )
+
+    def current_camera_ticks(self) -> tuple[int, int]:
+        entry = self._last_sent_bracket_ticks.get("camera")
+        if entry:
+            return self._clamp_tick(int(entry["pan"])), self._clamp_tick(int(entry["tilt"]))
+        return self.center_ticks_for_bracket("camera")
+
+    def current_camera_pose_degrees(self) -> tuple[float, float]:
+        cam_pan, cam_tilt = self.current_camera_ticks()
+        return self._camera_pose_degrees_for_ticks(cam_pan, cam_tilt)
 
     def parallel_hand_ticks_from_camera(self, cam_pan: int, cam_tilt: int) -> tuple[int, int, int, int]:
         cam_center_pan, cam_center_tilt = self.center_ticks_for_bracket("camera")
@@ -154,9 +170,12 @@ class ServoController:
         left_servos["l_tilt"] = l_tilt
 
         all_servos = dict(zero)
-        all_servos.update(cam_servos)
-        all_servos.update(right_servos)
-        all_servos.update(left_servos)
+        all_servos["cam_pan"] = cam_pan
+        all_servos["cam_tilt"] = cam_tilt
+        all_servos["r_pan"] = r_pan
+        all_servos["r_tilt"] = r_tilt
+        all_servos["l_pan"] = l_pan
+        all_servos["l_tilt"] = l_tilt
 
         # Single "dock" command only when Cam Dock firmware supports ACTIVE_PAIR_DOCK.
         if bool(self.calibration.get("use_dock_servo_pair", False)):
@@ -205,6 +224,72 @@ class ServoController:
         self._smoothed.clear()
         return dict(self.calibration)
 
+    def build_session_calibration_entry(
+        self,
+        side: str,
+        values: dict[str, Any],
+        distance_mm: float,
+        distance_source: str,
+    ) -> dict[str, Any]:
+        if side not in HAND_PREFIX:
+            raise ValueError(f"Unknown hand side: {side}")
+        x = max(0.0, min(1.0, float(values["x"])))
+        y = max(0.0, min(1.0, float(values["y"])))
+        distance_mm = max(1.0, float(distance_mm))
+        solution = self._geometry_solution_for_hand(side, x, y, distance_mm)
+        prefix = HAND_PREFIX[side]
+
+        pan_center_key, tilt_center_key = self._center_keys_for_bracket(side)
+        pan_center = self._calib_float(pan_center_key, 307.0)
+        tilt_center = self._calib_float(tilt_center_key, 307.0)
+        pan_ticks_per_deg = self._calib_float("pan_ticks_per_degree", 2.25)
+        tilt_ticks_per_deg = self._calib_float("tilt_ticks_per_degree", 2.25)
+        pan_sign = self._calib_float(f"{prefix}_pan_sign", -1.0)
+        tilt_sign = self._calib_float(f"{prefix}_tilt_sign", -1.0)
+        base_pan_offset = self._calib_float(f"{prefix}_pan_angle_offset_deg", 0.0)
+        base_tilt_offset = self._calib_float(f"{prefix}_tilt_angle_offset_deg", 0.0)
+
+        anchor_pan_tick = self._clamp_tick(round(pan_center))
+        anchor_tilt_tick = self._clamp_tick(round(tilt_center))
+        session_pan_offset = self._angle_offset_for_anchor_tick(
+            solution["yaw_deg"],
+            anchor_pan_tick,
+            pan_center,
+            pan_sign,
+            pan_ticks_per_deg,
+            base_pan_offset,
+        )
+        session_tilt_offset = self._angle_offset_for_anchor_tick(
+            solution["pitch_deg"],
+            anchor_tilt_tick,
+            tilt_center,
+            tilt_sign,
+            tilt_ticks_per_deg,
+            base_tilt_offset,
+        )
+        camera_pose = solution["camera_pose"]
+        point = solution["point_mm"]
+        return {
+            "x": round(x, 4),
+            "y": round(y, 4),
+            "tof_mm": round(distance_mm, 1),
+            "distance_source": distance_source,
+            "score": round(float(values.get("score") or 0.0), 4),
+            "neutral_yaw_deg": round(float(solution["yaw_deg"]), 4),
+            "neutral_pitch_deg": round(float(solution["pitch_deg"]), 4),
+            "pan_angle_offset_deg": round(session_pan_offset, 4),
+            "tilt_angle_offset_deg": round(session_tilt_offset, 4),
+            "anchor_pan_tick": anchor_pan_tick,
+            "anchor_tilt_tick": anchor_tilt_tick,
+            "camera_pan_tick": int(camera_pose["pan_tick"]),
+            "camera_tilt_tick": int(camera_pose["tilt_tick"]),
+            "camera_yaw_deg": round(float(camera_pose["yaw_deg"]), 4),
+            "camera_pitch_deg": round(float(camera_pose["pitch_deg"]), 4),
+            "point_x_mm": round(float(point[0]), 1),
+            "point_y_mm": round(float(point[1]), 1),
+            "point_z_mm": round(float(point[2]), 1),
+        }
+
     def disable_all(self) -> bool:
         self._smoothed.clear()
         self._hand_history.clear()
@@ -240,6 +325,7 @@ class ServoController:
                     "predicted_y_up": 1.0 - y,
                     "score": float(values.get("score") or 0.0),
                     "gesture": values.get("gesture"),
+                    "distance_debug": dict(self._last_distance_debug.get(side, {})),
                 }
             )
             hand_debug[side] = details
@@ -284,9 +370,13 @@ class ServoController:
 
     def _geometry_ticks_for_hand(self, side: str, x: float, y: float, distance_mm: float) -> tuple[int, int, dict[str, Any]]:
         prefix = HAND_PREFIX[side]
-        ray = self._camera_ray(x, y)
-        point = self._point_for_tof_distance(side, ray, distance_mm)
-        yaw_deg, pitch_deg = self._angles_for_point(side, point)
+        solution = self._geometry_solution_for_hand(side, x, y, distance_mm)
+        camera_ray = solution["camera_ray"]
+        ray = solution["ray"]
+        point = solution["point_mm"]
+        yaw_deg = solution["yaw_deg"]
+        pitch_deg = solution["pitch_deg"]
+        camera_pose = solution["camera_pose"]
 
         pan_center_key, tilt_center_key = self._center_keys_for_bracket(side)
         pan_center = self._calib_float(pan_center_key, 307.0)
@@ -294,24 +384,36 @@ class ServoController:
         pan_ticks_per_deg = self._calib_float("pan_ticks_per_degree", 2.25)
         tilt_ticks_per_deg = self._calib_float("tilt_ticks_per_degree", 2.25)
         pan_sign = self._calib_float(f"{prefix}_pan_sign", -1.0)
-        tilt_sign = self._calib_float(f"{prefix}_tilt_sign", 1.0)
+        tilt_sign = self._calib_float(f"{prefix}_tilt_sign", -1.0)
         pan_offset_deg = self._calib_float(f"{prefix}_pan_angle_offset_deg", 0.0)
         tilt_offset_deg = self._calib_float(f"{prefix}_tilt_angle_offset_deg", 0.0)
+        session_pan_offset_deg = self._session_angle_offset(side, "pan_angle_offset_deg")
+        session_tilt_offset_deg = self._session_angle_offset(side, "tilt_angle_offset_deg")
 
-        pan_target = pan_center + pan_sign * (yaw_deg + pan_offset_deg) * pan_ticks_per_deg
-        tilt_target = tilt_center + tilt_sign * (pitch_deg + tilt_offset_deg) * tilt_ticks_per_deg
+        pan_angle_deg = yaw_deg + pan_offset_deg + session_pan_offset_deg
+        tilt_angle_deg = pitch_deg + tilt_offset_deg + session_tilt_offset_deg
+        pan_target = pan_center + pan_sign * pan_angle_deg * pan_ticks_per_deg
+        tilt_target = tilt_center + tilt_sign * tilt_angle_deg * tilt_ticks_per_deg
         pan_tick = self._smooth_and_clamp_hand(f"{prefix}_pan", pan_target)
         tilt_tick = self._smooth_and_clamp_hand(f"{prefix}_tilt", tilt_target)
         return pan_tick, tilt_tick, {
             "distance_mm": distance_mm,
+            "camera_ray": camera_ray,
             "ray": ray,
             "point_mm": point,
             "yaw_deg": yaw_deg,
             "pitch_deg": pitch_deg,
+            "camera_pose": camera_pose,
             "pan_center": pan_center,
             "tilt_center": tilt_center,
             "pan_sign": pan_sign,
             "tilt_sign": tilt_sign,
+            "base_pan_offset_deg": pan_offset_deg,
+            "base_tilt_offset_deg": tilt_offset_deg,
+            "session_pan_offset_deg": session_pan_offset_deg,
+            "session_tilt_offset_deg": session_tilt_offset_deg,
+            "pan_angle_deg": pan_angle_deg,
+            "tilt_angle_deg": tilt_angle_deg,
             "pan_target": pan_target,
             "tilt_target": tilt_target,
             "pan_tick": pan_tick,
@@ -332,6 +434,109 @@ class ServoController:
         rz = 1.0
         length = math.sqrt(rx * rx + ry * ry + rz * rz)
         return rx / length, ry / length, rz / length
+
+    def _geometry_solution_for_hand(
+        self,
+        side: str,
+        x: float,
+        y: float,
+        distance_mm: float,
+    ) -> dict[str, Any]:
+        camera_ray = self._camera_ray(x, y)
+        camera_pose = self._camera_pose_debug()
+        pitched_ray = self._pitch_rotate_vector(camera_ray, math.radians(camera_pose["pitch_deg"]))
+        ray = self._normalize_vector(
+            self._yaw_local_to_global(pitched_ray, math.radians(camera_pose["yaw_deg"]))
+        )
+        point = self._point_for_tof_distance(side, ray, distance_mm)
+        yaw_deg, pitch_deg = self._angles_for_point(side, point)
+        return {
+            "camera_ray": camera_ray,
+            "ray": ray,
+            "point_mm": point,
+            "yaw_deg": yaw_deg,
+            "pitch_deg": pitch_deg,
+            "camera_pose": camera_pose,
+        }
+
+    def _camera_pose_debug(self) -> dict[str, Any]:
+        cam_pan, cam_tilt = self.current_camera_ticks()
+        yaw_deg, pitch_deg = self._camera_pose_degrees_for_ticks(cam_pan, cam_tilt)
+        return {
+            "pan_tick": cam_pan,
+            "tilt_tick": cam_tilt,
+            "yaw_deg": yaw_deg,
+            "pitch_deg": pitch_deg,
+        }
+
+    def _camera_pose_degrees_for_ticks(self, cam_pan: int, cam_tilt: int) -> tuple[float, float]:
+        yaw_deg = self._angle_from_servo_ticks(
+            cam_pan,
+            "cam_pan_center",
+            "pan_ticks_per_degree",
+            "cam_pan_sign",
+            "cam_pan_angle_offset_deg",
+            -1.0,
+        )
+        pitch_deg = self._angle_from_servo_ticks(
+            cam_tilt,
+            "cam_tilt_center",
+            "tilt_ticks_per_degree",
+            "cam_tilt_sign",
+            "cam_tilt_angle_offset_deg",
+            -1.0,
+        )
+        return yaw_deg, pitch_deg
+
+    def _angle_from_servo_ticks(
+        self,
+        tick: int,
+        center_key: str,
+        ticks_per_degree_key: str,
+        sign_key: str,
+        offset_key: str,
+        default_sign: float,
+    ) -> float:
+        center = self._calib_float(center_key, 307.0)
+        ticks_per_degree = self._calib_float(ticks_per_degree_key, 2.25)
+        sign = self._calib_float(sign_key, default_sign)
+        offset = self._calib_float(offset_key, 0.0)
+        denominator = sign * ticks_per_degree
+        if abs(denominator) < 0.0001:
+            return 0.0
+        return ((float(tick) - center) / denominator) - offset
+
+    @staticmethod
+    def _angle_offset_for_anchor_tick(
+        measured_angle_deg: float,
+        anchor_tick: int,
+        center_tick: float,
+        sign: float,
+        ticks_per_degree: float,
+        base_offset_deg: float,
+    ) -> float:
+        denominator = sign * ticks_per_degree
+        if abs(denominator) < 0.0001:
+            return 0.0
+        anchored_angle_deg = (float(anchor_tick) - center_tick) / denominator
+        return anchored_angle_deg - measured_angle_deg - base_offset_deg
+
+    def _session_angle_offset(self, side: str, key: str) -> float:
+        session = self.calibration.get("session_calibration", {})
+        side_data = session.get(side, {}) if isinstance(session, dict) else {}
+        if not isinstance(side_data, dict):
+            return 0.0
+        try:
+            return float(side_data.get(key, 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _normalize_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+        length = math.sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2])
+        if length <= 0.0001:
+            return 0.0, 0.0, 1.0
+        return vector[0] / length, vector[1] / length, vector[2] / length
 
     def _bracket_vector(self, side: str) -> tuple[float, float, float]:
         return (
@@ -447,23 +652,79 @@ class ServoController:
         return x, cos_p * y + sin_p * z, -sin_p * y + cos_p * z
 
     def _distance_mm_for_side(self, side: str, serial_state: dict[str, Any] | None) -> float:
+        startup_distance = self._startup_user_distance_mm()
         raw_tof_mm = self._tof_mm_from_serial(side, serial_state)
         if raw_tof_mm is not None:
             alpha = max(0.0, min(1.0, self._calib_float("tof_depth_alpha", 0.45)))
-            previous = self._last_distance_mm.get(side)
-            distance_mm = raw_tof_mm if previous is None else previous + alpha * (raw_tof_mm - previous)
+            previous_raw = self._last_raw_tof_mm.get(side)
+            smoothed_tof_mm = raw_tof_mm if previous_raw is None else previous_raw + alpha * (raw_tof_mm - previous_raw)
+            self._last_raw_tof_mm[side] = smoothed_tof_mm
+            if startup_distance is not None and self._use_startup_user_distance():
+                live_weight = max(0.0, min(1.0, self._calib_float("startup_distance_live_weight", 0.35)))
+                distance_mm = startup_distance + live_weight * (smoothed_tof_mm - startup_distance)
+                source = "startup_user_distance_blend"
+            else:
+                live_weight = 1.0
+                distance_mm = smoothed_tof_mm
+                source = "tof"
             self._last_distance_mm[side] = distance_mm
+            self._last_distance_debug[side] = {
+                "source": source,
+                "raw_tof_mm": raw_tof_mm,
+                "smoothed_tof_mm": smoothed_tof_mm,
+                "startup_user_distance_mm": startup_distance,
+                "startup_distance_live_weight": live_weight,
+                "effective_distance_mm": distance_mm,
+            }
             return distance_mm
 
         if side in self._last_distance_mm:
+            distance_mm = self._last_distance_mm[side]
+            self._last_distance_debug[side] = {
+                "source": "last_effective_distance",
+                "raw_tof_mm": None,
+                "smoothed_tof_mm": None,
+                "startup_user_distance_mm": startup_distance,
+                "startup_distance_live_weight": None,
+                "effective_distance_mm": distance_mm,
+            }
             return self._last_distance_mm[side]
+
+        if startup_distance is not None and self._use_startup_user_distance():
+            self._last_distance_mm[side] = startup_distance
+            self._last_distance_debug[side] = {
+                "source": "startup_user_distance",
+                "raw_tof_mm": None,
+                "smoothed_tof_mm": None,
+                "startup_user_distance_mm": startup_distance,
+                "startup_distance_live_weight": 0.0,
+                "effective_distance_mm": startup_distance,
+            }
+            return startup_distance
 
         session_distance = self._session_calibration_distance(side)
         if session_distance is not None:
             self._last_distance_mm[side] = session_distance
+            self._last_distance_debug[side] = {
+                "source": "session_hand_distance",
+                "raw_tof_mm": None,
+                "smoothed_tof_mm": None,
+                "startup_user_distance_mm": startup_distance,
+                "startup_distance_live_weight": None,
+                "effective_distance_mm": session_distance,
+            }
             return session_distance
 
-        return self._calib_float("initial_hand_distance_mm", 700.0)
+        distance_mm = self._calib_float("initial_hand_distance_mm", 700.0)
+        self._last_distance_debug[side] = {
+            "source": "initial_hand_distance",
+            "raw_tof_mm": None,
+            "smoothed_tof_mm": None,
+            "startup_user_distance_mm": startup_distance,
+            "startup_distance_live_weight": None,
+            "effective_distance_mm": distance_mm,
+        }
+        return distance_mm
 
     def _tof_mm_from_serial(self, side: str, serial_state: dict[str, Any] | None) -> float | None:
         if not isinstance(serial_state, dict):
@@ -480,6 +741,31 @@ class ServoController:
         if not isinstance(side_data, dict):
             return None
         return self._valid_tof_mm(side_data.get("tof_mm"))
+
+    def _startup_user_distance_mm(self) -> float | None:
+        session = self.calibration.get("session_calibration", {})
+        if isinstance(session, dict):
+            distance = self._valid_tof_mm(session.get("user_distance_mm"))
+            if distance is not None:
+                return distance
+
+            side_distances = []
+            for side in ("right", "left"):
+                side_data = session.get(side, {})
+                if not isinstance(side_data, dict):
+                    continue
+                side_distance = self._valid_tof_mm(side_data.get("tof_mm"))
+                if side_distance is not None:
+                    side_distances.append(side_distance)
+            if side_distances:
+                return sum(side_distances) / len(side_distances)
+        return None
+
+    def _use_startup_user_distance(self) -> bool:
+        try:
+            return int(float(self.calibration.get("use_startup_user_distance", 1))) != 0
+        except (TypeError, ValueError):
+            return True
 
     def _valid_tof_mm(self, value: Any) -> float | None:
         try:

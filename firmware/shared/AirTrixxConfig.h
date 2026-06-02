@@ -99,6 +99,8 @@ static const float DOCK_CAMERA_VERTICAL_FOV_DEG   = 43.0f;
 static const float DOCK_INITIAL_HAND_DISTANCE_MM  = 700.0f;
 static const float DOCK_MIN_VALID_TOF_MM          = 80.0f;
 static const float DOCK_MAX_VALID_TOF_MM          = 2000.0f;
+static const bool DOCK_USE_STARTUP_USER_DISTANCE  = true;
+static const float DOCK_STARTUP_DISTANCE_LIVE_WEIGHT = 0.35f;
 static const float DOCK_TRACKING_LATENCY_MS       = 50.0f;
 
 // Servo angle conversion placeholders. Tune these once per build after finding
@@ -106,6 +108,10 @@ static const float DOCK_TRACKING_LATENCY_MS       = 50.0f;
 // 2.27 PCA9685 ticks per degree at 50 Hz.
 static const float DOCK_PAN_TICKS_PER_DEGREE  = 2.25f;
 static const float DOCK_TILT_TICKS_PER_DEGREE = 2.25f;
+static const float DOCK_CAM_PAN_SIGN          = -1.0f;
+static const float DOCK_CAM_TILT_SIGN         = -1.0f;
+static const float DOCK_CAM_PAN_OFFSET_DEG    = 0.0f;
+static const float DOCK_CAM_TILT_OFFSET_DEG   = 0.0f;
 static const float DOCK_RIGHT_PAN_SIGN        = -1.0f;
 static const float DOCK_RIGHT_TILT_SIGN       = -1.0f;
 static const float DOCK_LEFT_PAN_SIGN         = -1.0f;

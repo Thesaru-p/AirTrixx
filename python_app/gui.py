@@ -117,6 +117,8 @@ CALIBRATION_ENTRY_KEYS = [
     "min_valid_tof_mm",
     "max_valid_tof_mm",
     "tof_depth_alpha",
+    "use_startup_user_distance",
+    "startup_distance_live_weight",
     "prediction_latency_ms",
     "camera_horizontal_fov_deg",
     "camera_vertical_fov_deg",
@@ -140,6 +142,10 @@ CALIBRATION_ENTRY_KEYS = [
     "right_tof_offset_z_mm",
     "pan_ticks_per_degree",
     "tilt_ticks_per_degree",
+    "cam_pan_sign",
+    "cam_tilt_sign",
+    "cam_pan_angle_offset_deg",
+    "cam_tilt_angle_offset_deg",
     "r_pan_sign",
     "r_tilt_sign",
     "l_pan_sign",
@@ -159,6 +165,7 @@ FLOAT_CALIBRATION_KEYS = {
     "min_valid_tof_mm",
     "max_valid_tof_mm",
     "tof_depth_alpha",
+    "startup_distance_live_weight",
     "prediction_latency_ms",
     "camera_horizontal_fov_deg",
     "camera_vertical_fov_deg",
@@ -182,6 +189,10 @@ FLOAT_CALIBRATION_KEYS = {
     "right_tof_offset_z_mm",
     "pan_ticks_per_degree",
     "tilt_ticks_per_degree",
+    "cam_pan_sign",
+    "cam_tilt_sign",
+    "cam_pan_angle_offset_deg",
+    "cam_tilt_angle_offset_deg",
     "r_pan_sign",
     "r_tilt_sign",
     "l_pan_sign",
@@ -2428,6 +2439,23 @@ class AirTrixxGUI:
                 details = hands.get(side)
                 if not isinstance(details, dict):
                     continue
+                camera_pose = details.get("camera_pose", {})
+                camera_pose_text = "-"
+                if isinstance(camera_pose, dict):
+                    camera_pose_text = (
+                        f"ticks=({camera_pose.get('pan_tick', '-')},{camera_pose.get('tilt_tick', '-')})"
+                        f"/deg=({self._fmt(camera_pose.get('yaw_deg'), 2)},"
+                        f"{self._fmt(camera_pose.get('pitch_deg'), 2)})"
+                    )
+                distance_debug = details.get("distance_debug", {})
+                distance_text = "-"
+                if isinstance(distance_debug, dict):
+                    distance_text = (
+                        f"{distance_debug.get('source', '-')}"
+                        f"/raw={self._fmt(distance_debug.get('raw_tof_mm'), 1)}"
+                        f"/startup={self._fmt(distance_debug.get('startup_user_distance_mm'), 1)}"
+                        f"/eff={self._fmt(distance_debug.get('effective_distance_mm'), 1)}"
+                    )
                 lines.append(
                     "  "
                     f"{side}:"
@@ -2436,8 +2464,13 @@ class AirTrixxGUI:
                     f" y_up={self._fmt(details.get('predicted_y_up'))}"
                     f" score={self._fmt(details.get('score'), 2)}"
                     f" dist_mm={self._fmt(details.get('distance_mm'), 1)}"
+                    f" dist_ref={distance_text}"
                     f" yaw={self._fmt(details.get('yaw_deg'), 2)}"
                     f" pitch={self._fmt(details.get('pitch_deg'), 2)}"
+                    f" cam_pose={camera_pose_text}"
+                    f" angle=({self._fmt(details.get('pan_angle_deg'), 2)},{self._fmt(details.get('tilt_angle_deg'), 2)})"
+                    f" session_offset=({self._fmt(details.get('session_pan_offset_deg'), 2)},"
+                    f"{self._fmt(details.get('session_tilt_offset_deg'), 2)})"
                     f" target=({self._fmt(details.get('pan_target'), 1)},{self._fmt(details.get('tilt_target'), 1)})"
                     f" ticks=({details.get('pan_tick', '-')},{details.get('tilt_tick', '-')})"
                     f" ray={self._fmt_tuple(details.get('ray'))}"
@@ -2549,6 +2582,10 @@ class AirTrixxGUI:
     def start_hand_calibration(self, auto: bool = False) -> None:
         if self._apply_calibration_entries() is None:
             return
+        calibration = dict(self.config.calibration)
+        calibration["session_calibration"] = {}
+        self.config.calibration = calibration
+        self.servo_controller.update_calibration(calibration)
         self.startup_hand_calibration_pending = False
         self.camera_centering_active = False
         self.centering_bracket = None
@@ -2596,6 +2633,11 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s = None
         self.hand_calibration_auto_capture = True
         self._calibration_last_trackable_hands = {}
+        calibration = dict(self.config.calibration)
+        calibration["session_calibration"] = {}
+        self.config.calibration = calibration
+        self.servo_controller.update_calibration(calibration)
+        save_calibration(calibration, self.config.calibration_path)
         self.hand_calibration_status_var.set(
             "Calibration phase: skipped; using saved dock geometry values."
         )
@@ -2603,7 +2645,7 @@ class AirTrixxGUI:
 
     def _set_hand_calibration_prompt(self) -> None:
         self.hand_calibration_status_var.set(
-            "Calibration phase: place both hands in neutral start pose."
+            "Calibration phase: hold both open palms in front of your chest."
         )
 
     def _best_visible_hand(self, hands: dict[str, dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]] | None:
@@ -2646,11 +2688,11 @@ class AirTrixxGUI:
             if trackable_hands:
                 visible_sides = ", ".join(sorted(trackable_hands.keys()))
                 self.hand_calibration_status_var.set(
-                    f"Calibration phase: tracking {visible_sides} hand(s); show both hands in neutral pose."
+                    f"Calibration phase: tracking {visible_sides} hand(s); show both open palms in front of your chest."
                 )
             else:
                 self.hand_calibration_status_var.set(
-                    "Calibration phase: place both hands in view at neutral start pose."
+                    "Calibration phase: place both open palms in view at chest height."
                 )
             return
 
@@ -2712,8 +2754,9 @@ class AirTrixxGUI:
         serial_state: dict[str, Any],
     ) -> None:
         calibration = dict(self.config.calibration)
-        session: dict[str, dict[str, Any]] = {}
+        session: dict[str, Any] = {}
         valid_tof_values: list[float] = []
+        captured_distances: list[float] = []
         fallback_distance = float(calibration.get("initial_hand_distance_mm", 700.0))
 
         for side in ("right", "left"):
@@ -2724,14 +2767,17 @@ class AirTrixxGUI:
                 tof_mm = fallback_distance
             else:
                 valid_tof_values.append(tof_mm)
-            session[side] = {
-                "x": round(float(values["x"]), 4),
-                "y": round(float(values["y"]), 4),
-                "tof_mm": round(float(tof_mm), 1),
-                "distance_source": source,
-                "score": round(float(values.get("score") or 0.0), 4),
-            }
+            captured_distances.append(float(tof_mm))
+            session[side] = self.servo_controller.build_session_calibration_entry(
+                side,
+                values,
+                tof_mm,
+                source,
+            )
 
+        startup_user_distance_mm = sum(captured_distances) / len(captured_distances) if captured_distances else fallback_distance
+        session["user_distance_mm"] = round(startup_user_distance_mm, 1)
+        session["user_distance_source"] = "tof" if valid_tof_values else "fallback"
         if valid_tof_values:
             calibration["initial_hand_distance_mm"] = round(sum(valid_tof_values) / len(valid_tof_values), 1)
         calibration["session_calibration"] = session
@@ -2747,9 +2793,12 @@ class AirTrixxGUI:
         self.hand_calibration_seen_since_s = None
         self._calibration_last_trackable_hands = {}
         self.hand_calibration_status_var.set(
-            "Calibration phase: saved neutral hand pose and starting distance."
+            f"Calibration phase: saved neutral pose and startup distance {startup_user_distance_mm:.0f} mm."
         )
-        self.log(f"Saved dock geometry session calibration to {self.config.calibration_path}.")
+        self.log(
+            f"Saved dock geometry session calibration to {self.config.calibration_path} "
+            f"(startup user distance {startup_user_distance_mm:.0f} mm)."
+        )
 
     def _valid_calibration_tof_mm(self, side: str, serial_state: dict[str, Any]) -> float | None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
@@ -3098,7 +3147,7 @@ class AirTrixxGUI:
             status = reason
         self.camera_centering_status_var.set(f"Camera centering: {status}.")
         self.log(f"Camera centering finished: {reason}.")
-        if reason in ("centered", "face_found") and self.startup_hand_calibration_pending:
+        if self.startup_hand_calibration_pending:
             self.start_hand_calibration(auto=True)
 
     def _lock_camera_bracket_position(self) -> None:
@@ -3434,6 +3483,13 @@ class AirTrixxGUI:
         add("Calibration", "boundary_bottom", self.config.calibration.get("hand_boundary_bottom"))
         add("Calibration", "dock_geometry", self.config.calibration.get("use_dock_geometry"))
         add("Calibration", "initial_distance_mm", self.config.calibration.get("initial_hand_distance_mm"))
+        session_calibration = self.config.calibration.get("session_calibration", {})
+        if not isinstance(session_calibration, dict):
+            session_calibration = {}
+        add("Calibration", "startup_user_distance_mm", session_calibration.get("user_distance_mm"))
+        add("Calibration", "startup_distance_source", session_calibration.get("user_distance_source"))
+        add("Calibration", "use_startup_user_distance", self.config.calibration.get("use_startup_user_distance"))
+        add("Calibration", "startup_distance_live_weight", self.config.calibration.get("startup_distance_live_weight"))
         add("MediaPipe", "right_visible", right.get("visible"))
         add("MediaPipe", "right_gesture", right.get("gesture"))
         add("MediaPipe", "right_x", right.get("x"))
