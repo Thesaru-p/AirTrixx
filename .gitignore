@@ -5,6 +5,7 @@ __pycache__/
 python_app/__pycache__/
 python_app/**/__pycache__/
 python_app/**/*.pyc
+.venv-codex
 
 # Local user calibration and captured data
 python_app/config/calibration.json

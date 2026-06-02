@@ -30,6 +30,10 @@ HAND_LANDMARKER_MODEL_CANDIDATES = (
     project_resource_path("models", "hand_landmarker.task"),
     project_resource_path("packaging", "assets", "generated", "hand_landmarker.task"),
 )
+MIN_VISIBLE_FRAME_MEAN = 2.0
+MIN_VISIBLE_FRAME_STD = 4.0
+CAMERA_VALIDATION_FRAMES = 30
+CAMERA_MIN_VISIBLE_VALIDATION_FRAMES = 5
 HAND_CONNECTIONS = (
     (0, 1),
     (1, 2),
@@ -327,7 +331,9 @@ class HandTracker:
 
     def _open_camera_capture(self, preferred_index: int) -> tuple[Any | None, int | None]:
         # Try the selected camera first, then a few common fallback indices.
-        trial_indices: list[int] = [preferred_index]
+        trial_indices: list[int] = []
+        if preferred_index >= 0:
+            trial_indices.append(preferred_index)
         for fallback_index in (0, 1, 2, 3):
             if fallback_index not in trial_indices:
                 trial_indices.append(fallback_index)
@@ -338,9 +344,32 @@ class HandTracker:
                 cap.release()
                 cap = cv2.VideoCapture(camera_index)
             if cap.isOpened():
-                return cap, camera_index
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                if self._capture_has_visible_frame(cap):
+                    return cap, camera_index
+                self._log(f"Camera index {camera_index} opened but produced only black frames; trying fallback.")
+                cap.release()
+                continue
             cap.release()
         return None, None
+
+    @staticmethod
+    def _capture_has_visible_frame(cap: Any) -> bool:
+        visible_frames = 0
+        for _ in range(CAMERA_VALIDATION_FRAMES):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.03)
+                continue
+            frame_mean = float(np.mean(frame))
+            frame_std = float(np.std(frame))
+            if frame_mean >= MIN_VISIBLE_FRAME_MEAN or frame_std >= MIN_VISIBLE_FRAME_STD:
+                visible_frames += 1
+                if visible_frames >= CAMERA_MIN_VISIBLE_VALIDATION_FRAMES:
+                    return True
+            time.sleep(0.03)
+        return False
 
     def _run(self) -> None:
         requested_camera_index = self.camera_index
@@ -367,15 +396,17 @@ class HandTracker:
                     "MediaPipe Hands could not be loaded. "
                     f"Installed mediapipe version={version}, path={location}. "
                     f"Legacy error: {type(exc).__name__}: {exc}. "
-                    f"Tasks error: {type(task_exc).__name__}: {task_exc}."
+                    f"Tasks error: {type(task_exc).__name__}: {task_exc}. "
+                    "Camera preview will continue without hand tracking."
                 )
-                return
-            if model_path is None:
+                mode = "preview"
+            if mode == "tasks" and model_path is None:
                 self._log(
                     "MediaPipe Tasks is installed, but hand_landmarker.task is missing. "
-                    "Run packaging/download_models.py before packaging or source runs."
+                    "Run packaging/download_models.py before packaging or source runs. "
+                    "Camera preview will continue without hand tracking."
                 )
-                return
+                mode = "preview"
 
         cap, active_camera_index = self._open_camera_capture(requested_camera_index)
         if cap is None or active_camera_index is None:
@@ -470,8 +501,10 @@ class HandTracker:
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 if mode == "legacy":
                     state = process_legacy(frame_rgb, frame_bgr, detector)
-                else:
+                elif mode == "tasks":
                     state = process_tasks(frame_rgb, frame_bgr, detector)
+                else:
+                    state = _empty_hand_state()
                 face_state = _empty_face_state()
 
                 if face_cascade is not None:
@@ -527,7 +560,7 @@ class HandTracker:
                     min_tracking_confidence=0.45,
                 ) as hands:
                     run_loop(hands, "MediaPipe Solutions")
-            else:
+            elif mode == "tasks":
                 if legacy_error:
                     self._log(f"MediaPipe Solutions unavailable; using MediaPipe Tasks ({type(legacy_error).__name__}).")
                 options = vision.HandLandmarkerOptions(
@@ -540,6 +573,8 @@ class HandTracker:
                 )
                 with vision.HandLandmarker.create_from_options(options) as landmarker:
                     run_loop(landmarker, "MediaPipe Tasks")
+            else:
+                run_loop(None, "Preview-only")
         finally:
             cap.release()
         self._log("MediaPipe hand tracker stopped.")

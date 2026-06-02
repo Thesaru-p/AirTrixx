@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import http.server
+import io
 import json
 import os
 import platform
@@ -17,7 +18,7 @@ from tkinter import filedialog, ttk
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont
 
 from app_paths import project_resource_path
 from config import AppConfig, load_calibration, save_calibration
@@ -222,7 +223,7 @@ class AirTrixxGUI:
         self.servo_controller = servo_controller
         self.fusion_state = fusion_state
         self.log_queue: queue.Queue[str] = queue.Queue()
-        self._photo: ImageTk.PhotoImage | None = None
+        self._photo: tk.PhotoImage | None = None
         self._last_text_update_s = 0.0
         self._latest_snapshot: dict[str, Any] = {}
         self.centering_bracket: str | None = None
@@ -242,7 +243,7 @@ class AirTrixxGUI:
         self.active_page = "Dashboard"
         self.camera_popup: tk.Toplevel | None = None
         self.camera_popup_label: ttk.Label | None = None
-        self._popup_photo: ImageTk.PhotoImage | None = None
+        self._popup_photo: tk.PhotoImage | None = None
         self._last_servo_debug_sequence = 0
         self._last_servo_debug_log_s = 0.0
         self.ota_server: http.server.ThreadingHTTPServer | None = None
@@ -1725,8 +1726,14 @@ class AirTrixxGUI:
             return
         image = Image.new("RGB", (CAMERA_POPUP_WIDTH, CAMERA_POPUP_HEIGHT), "#111827")
         self._draw_camera_instruction_overlay(image)
-        self._popup_photo = ImageTk.PhotoImage(image=image)
+        self._popup_photo = self._photo_image_from_pil(image)
         self.camera_popup_label.configure(image=self._popup_photo)
+
+    @staticmethod
+    def _photo_image_from_pil(image: Image.Image) -> tk.PhotoImage:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return tk.PhotoImage(data=buffer.getvalue())
 
     def _close_camera_popup(self) -> None:
         if self.camera_popup is not None and self.camera_popup.winfo_exists():
@@ -3126,14 +3133,14 @@ class AirTrixxGUI:
         self._draw_camera_instruction_overlay(image)
         preview_image = image.copy()
         preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
-        self._photo = ImageTk.PhotoImage(image=preview_image)
+        self._photo = self._photo_image_from_pil(preview_image)
         self.preview_label.configure(image=self._photo)
         if self.camera_popup is not None and self.camera_popup.winfo_exists() and self.camera_popup_label is not None:
             popup_image = image.copy()
             width = max(1, self.camera_popup.winfo_width())
             height = max(1, self.camera_popup.winfo_height())
             popup_image.thumbnail((width, height), Image.Resampling.LANCZOS)
-            self._popup_photo = ImageTk.PhotoImage(image=popup_image)
+            self._popup_photo = self._photo_image_from_pil(popup_image)
             self.camera_popup_label.configure(image=self._popup_photo)
         elif self.camera_popup is not None:
             self.camera_popup = None
