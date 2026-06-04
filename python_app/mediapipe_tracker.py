@@ -34,6 +34,8 @@ MIN_VISIBLE_FRAME_MEAN = 2.0
 MIN_VISIBLE_FRAME_STD = 4.0
 CAMERA_VALIDATION_FRAMES = 30
 CAMERA_MIN_VISIBLE_VALIDATION_FRAMES = 5
+CAMERA_CAPTURE_FPS = 30
+CAMERA_BUFFER_SIZE = 1
 HAND_CONNECTIONS = (
     (0, 1),
     (1, 2),
@@ -163,11 +165,15 @@ class HandTracker:
         camera_index: int = 0,
         width: int = 640,
         height: int = 480,
+        tracking_frame_skip: int = 1,
+        face_detection_enabled: bool = True,
         on_log: LogCallback | None = None,
     ) -> None:
         self.camera_index = camera_index
-        self.width = width
-        self.height = height
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        self.tracking_frame_skip = max(0, int(tracking_frame_skip))
+        self.face_detection_enabled = bool(face_detection_enabled)
         self.on_log = on_log
         self.mirror_preview = True
         self._stop_event = threading.Event()
@@ -177,12 +183,15 @@ class HandTracker:
         self._latest_face = _empty_face_state()
         self._selected_face: dict[str, Any] | None = None
         self._latest_frame_rgb: np.ndarray | None = None
+        self._running_requested = False
+        self._restart_generation = 0
 
     def _log(self, message: str) -> None:
         if self.on_log:
             self.on_log(message)
 
     def start(self) -> None:
+        self._running_requested = True
         if self._thread and self._thread.is_alive():
             return
         if cv2 is None or mp is None:
@@ -193,28 +202,69 @@ class HandTracker:
         self._thread.start()
 
     def stop(self) -> None:
+        self._running_requested = False
         self._stop_event.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=1.0)
 
-    def configure(self, camera_index: int | None = None, mirror_preview: bool | None = None) -> None:
-        restart = camera_index is not None and camera_index != self.camera_index
+    def configure(
+        self,
+        camera_index: int | None = None,
+        mirror_preview: bool | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        tracking_frame_skip: int | None = None,
+        face_detection_enabled: bool | None = None,
+    ) -> None:
+        new_width = self.width if width is None else max(1, int(width))
+        new_height = self.height if height is None else max(1, int(height))
+        restart = bool(
+            (camera_index is not None and camera_index != self.camera_index)
+            or new_width != self.width
+            or new_height != self.height
+        )
         if mirror_preview is not None:
             self.mirror_preview = bool(mirror_preview)
         if camera_index is not None:
             self.camera_index = int(camera_index)
+        self.width = new_width
+        self.height = new_height
+        if tracking_frame_skip is not None:
+            self.tracking_frame_skip = max(0, min(8, int(tracking_frame_skip)))
+        if face_detection_enabled is not None:
+            self.face_detection_enabled = bool(face_detection_enabled)
         if restart:
-            was_running = bool(self._thread and self._thread.is_alive())
-            self.stop()
+            was_running = self._running_requested or bool(self._thread and self._thread.is_alive())
+            self._restart_generation += 1
+            restart_generation = self._restart_generation
+            previous_thread = self._thread
+            self._stop_event.set()
             with self._lock:
                 self._latest_hands = _empty_hand_state()
                 self._latest_face = _empty_face_state()
                 self._selected_face = None
                 self._latest_frame_rgb = None
             if was_running:
-                self._stop_event.clear()
-                self.start()
+                threading.Thread(
+                    target=self._restart_when_stopped,
+                    args=(previous_thread, restart_generation),
+                    daemon=True,
+                ).start()
+
+    def _restart_when_stopped(
+        self,
+        previous_thread: threading.Thread | None,
+        restart_generation: int,
+    ) -> None:
+        if previous_thread and previous_thread.is_alive() and previous_thread is not threading.current_thread():
+            previous_thread.join()
+        if not self._running_requested:
+            return
+        if restart_generation != self._restart_generation:
+            return
+        self._stop_event.clear()
+        self.start()
 
     def get_latest_hands(self) -> dict[str, dict[str, Any]]:
         with self._lock:
@@ -228,6 +278,10 @@ class HandTracker:
             if self._latest_frame_rgb is None:
                 return None
             return self._latest_frame_rgb.copy()
+
+    def has_latest_frame(self) -> bool:
+        with self._lock:
+            return self._latest_frame_rgb is not None
 
     def get_latest_face(self) -> dict[str, Any]:
         with self._lock:
@@ -344,6 +398,12 @@ class HandTracker:
                 cap.release()
                 cap = cv2.VideoCapture(camera_index)
             if cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                    cap.set(cv2.CAP_PROP_FPS, CAMERA_CAPTURE_FPS)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFER_SIZE)
+                except Exception:
+                    pass
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                 if self._capture_has_visible_frame(cap):
@@ -490,24 +550,33 @@ class HandTracker:
         def run_loop(detector: Any, detector_label: str) -> None:
             self._log(
                 f"{detector_label} hand tracker started on camera index {active_camera_index} "
-                f"(requested {requested_camera_index})."
+                f"(requested {requested_camera_index}, {self.width}x{self.height}, "
+                f"tracking frame skip {self.tracking_frame_skip})."
             )
+            frame_index = 0
+            last_hand_state = _empty_hand_state()
             while not self._stop_event.is_set():
                 ok, frame_bgr = cap.read()
                 if not ok:
                     time.sleep(0.03)
                     continue
 
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                if mode == "legacy":
+                frame_skip = max(0, int(self.tracking_frame_skip))
+                process_hands = frame_index % (frame_skip + 1) == 0
+                frame_index += 1
+                if process_hands and mode == "legacy":
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     state = process_legacy(frame_rgb, frame_bgr, detector)
-                elif mode == "tasks":
+                    last_hand_state = state
+                elif process_hands and mode == "tasks":
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     state = process_tasks(frame_rgb, frame_bgr, detector)
+                    last_hand_state = state
                 else:
-                    state = _empty_hand_state()
+                    state = {side: dict(values) for side, values in last_hand_state.items()}
                 face_state = _empty_face_state()
 
-                if face_cascade is not None:
+                if face_cascade is not None and self.face_detection_enabled:
                     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(
                         gray,
@@ -541,6 +610,8 @@ class HandTracker:
                                 )
                     else:
                         self._selected_face = None
+                elif not self.face_detection_enabled:
+                    self._selected_face = None
 
                 annotated_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 if self.mirror_preview:

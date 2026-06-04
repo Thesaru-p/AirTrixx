@@ -101,6 +101,11 @@ static const float DOCK_MIN_VALID_TOF_MM          = 80.0f;
 static const float DOCK_MAX_VALID_TOF_MM          = 2000.0f;
 static const bool DOCK_USE_STARTUP_USER_DISTANCE  = true;
 static const float DOCK_STARTUP_DISTANCE_LIVE_WEIGHT = 0.35f;
+static const uint8_t DOCK_TRACKING_FRAME_SKIP = 1;
+static const uint8_t DOCK_PREVIEW_FPS = 10;
+static const bool DOCK_FACE_DETECTION_ENABLED_AFTER_CENTERING = false;
+static const uint16_t DOCK_CAMERA_WIDTH = 424;
+static const uint16_t DOCK_CAMERA_HEIGHT = 240;
 static const float DOCK_TRACKING_LATENCY_MS       = 50.0f;
 
 // Servo angle conversion placeholders. Tune these once per build after finding

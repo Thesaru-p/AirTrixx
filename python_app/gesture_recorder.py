@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,18 @@ from fusion_state import FIELD_ORDER
 
 SnapshotProvider = Callable[[], dict[str, Any]]
 StatusCallback = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class GestureRecordingState:
+    phase: str = "idle"
+    gesture_name: str = ""
+    repetition_index: int = 0
+    repetitions: int = 0
+    countdown_remaining_s: float = 0.0
+    recording_elapsed_s: float = 0.0
+    duration_s: float = 0.0
+    progress: float = 0.0
 
 
 class GestureRecorder:
@@ -29,7 +42,8 @@ class GestureRecorder:
         self.sample_hz = sample_hz
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._progress = 0.0
+        self._state_lock = threading.Lock()
+        self._state = GestureRecordingState()
 
     @property
     def is_recording(self) -> bool:
@@ -37,7 +51,12 @@ class GestureRecorder:
 
     @property
     def progress(self) -> float:
-        return self._progress
+        return self.state.progress
+
+    @property
+    def state(self) -> GestureRecordingState:
+        with self._state_lock:
+            return self._state
 
     def start(self, gesture_name: str, repetitions: int, duration_s: float, countdown_s: int = 3) -> bool:
         if self.is_recording:
@@ -54,7 +73,16 @@ class GestureRecorder:
         countdown_s = max(0, int(countdown_s))
 
         self._stop_event.clear()
-        self._progress = 0.0
+        self._set_state(
+            phase="starting",
+            gesture_name=clean_name,
+            repetition_index=1,
+            repetitions=repetitions,
+            countdown_remaining_s=float(countdown_s),
+            recording_elapsed_s=0.0,
+            duration_s=duration_s,
+            progress=0.0,
+        )
         self._thread = threading.Thread(
             target=self._record_worker,
             args=(clean_name, repetitions, duration_s, countdown_s),
@@ -81,7 +109,7 @@ class GestureRecorder:
 
         def update_progress() -> None:
             elapsed = time.time() - session_start
-            self._progress = min(1.0, elapsed / max(0.001, total_duration))
+            self._set_state(progress=min(1.0, elapsed / max(0.001, total_duration)))
 
         for rep in range(1, repetitions + 1):
             if self._stop_event.is_set():
@@ -89,11 +117,26 @@ class GestureRecorder:
 
             for remaining in range(countdown_s, 0, -1):
                 update_progress()
+                self._set_state(
+                    phase="countdown",
+                    repetition_index=rep,
+                    countdown_remaining_s=float(remaining),
+                    recording_elapsed_s=0.0,
+                    duration_s=duration_s,
+                )
                 self._status(f"{gesture_name} rep {rep}/{repetitions}: starting in {remaining}...")
                 if self._sleep_interruptible(1.0):
+                    self._mark_stopped()
                     return
 
             self._status(f"Recording {gesture_name} rep {rep}/{repetitions}.")
+            self._set_state(
+                phase="recording",
+                repetition_index=rep,
+                countdown_remaining_s=0.0,
+                recording_elapsed_s=0.0,
+                duration_s=duration_s,
+            )
             samples: list[dict[str, Any]] = []
             start = time.time()
             end = start + duration_s
@@ -102,6 +145,7 @@ class GestureRecorder:
             while time.time() < end and not self._stop_event.is_set():
                 now = time.time()
                 update_progress()
+                self._set_state(recording_elapsed_s=min(duration_s, now - start))
                 snapshot = self.snapshot_provider()
                 samples.append(
                     {
@@ -113,8 +157,10 @@ class GestureRecorder:
                 )
                 sleep_for = max(0.0, interval - (time.time() - now))
                 if self._sleep_interruptible(sleep_for):
+                    self._mark_stopped()
                     return
 
+            self._set_state(phase="saving", recording_elapsed_s=duration_s, countdown_remaining_s=0.0)
             finished = time.time()
             sample_rate = len(samples) / max(0.001, finished - start)
             final_snapshot = self.snapshot_provider()
@@ -136,12 +182,37 @@ class GestureRecorder:
                 f.write("\n")
             self._status(f"Saved {output_path}")
 
-        self._progress = 1.0
+        if self._stop_event.is_set():
+            self._mark_stopped()
+            return
+
+        self._set_state(
+            phase="finished",
+            countdown_remaining_s=0.0,
+            recording_elapsed_s=duration_s,
+            progress=1.0,
+        )
         self._status("Gesture recording finished.")
-        self._progress = 0.0
 
     def _sleep_interruptible(self, seconds: float) -> bool:
         return self._stop_event.wait(max(0.0, seconds))
+
+    def _set_state(self, **changes: Any) -> None:
+        with self._state_lock:
+            self._state = replace(self._state, **changes)
+
+    def _mark_stopped(self) -> None:
+        self._set_state(
+            phase="idle",
+            gesture_name="",
+            repetition_index=0,
+            repetitions=0,
+            countdown_remaining_s=0.0,
+            recording_elapsed_s=0.0,
+            duration_s=0.0,
+            progress=0.0,
+        )
+        self._status("Gesture recording stopped.")
 
     def _status(self, message: str) -> None:
         if self.on_status:

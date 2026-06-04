@@ -26,7 +26,7 @@ ACTION_TYPES = {
     "mouse_absolute",
 }
 
-COMPARATORS = {
+STANDARD_COMPARATORS = {
     "lt",
     "lte",
     "gt",
@@ -38,6 +38,19 @@ COMPARATORS = {
     "present",
     "truthy",
     "falsey",
+}
+DELTA_COMPARATORS = {
+    "delta_decrease",
+    "delta_increase",
+}
+COMPARATORS = STANDARD_COMPARATORS | DELTA_COMPARATORS
+GESTURE_COOLDOWN_SEC = 0.6
+WRIST_GESTURE_SIGNAL_NAMES = {
+    "fused.wrist_roll_right_detected": "wrist_roll_right",
+    "fused.wrist_roll_left_detected": "wrist_roll_left",
+    "fused.wrist_pitch_up_detected": "wrist_pitch_up",
+    "fused.wrist_pitch_down_detected": "wrist_pitch_down",
+    "fused.wrist_roll_right_then_neutral_detected": "wrist_roll_right_then_neutral",
 }
 
 
@@ -143,6 +156,8 @@ class SignalCatalog:
                 add("Hands", f"hands.{side}.visible", f"{label} visible", hand.get("visible"))
                 add("Hands", f"hands.{side}.x", f"{label} x", hand.get("x"))
                 add("Hands", f"hands.{side}.y", f"{label} image y", hand.get("y"))
+                z_mm = input_dict.get(f"{side}_hand_z_mm") if hand.get("visible") else None
+                add("Hands", f"hands.{side}.z_mm", f"{label} z mm", z_mm)
                 add("Hands", f"hands.{side}.score", f"{label} score", hand.get("score"))
                 add("Hands", f"hands.{side}.gesture", f"{label} gesture", hand.get("gesture"))
 
@@ -192,6 +207,8 @@ class MappingAction:
     speed_y: float = 0.0
     absolute_x: float = 0.5
     absolute_y: float = 0.5
+    absolute_x_source: str = ""
+    absolute_y_source: str = ""
     continuous: bool = False
 
     @classmethod
@@ -213,6 +230,8 @@ class MappingAction:
             speed_y=float(data.get("speed_y", 0.0) or 0.0),
             absolute_x=max(0.0, min(1.0, float(data.get("absolute_x", 0.5) or 0.0))),
             absolute_y=max(0.0, min(1.0, float(data.get("absolute_y", 0.5) or 0.0))),
+            absolute_x_source=str(data.get("absolute_x_source") or ""),
+            absolute_y_source=str(data.get("absolute_y_source") or ""),
             continuous=bool(data.get("continuous", False)),
         )
 
@@ -229,6 +248,8 @@ class MappingAction:
             "speed_y": self.speed_y,
             "absolute_x": self.absolute_x,
             "absolute_y": self.absolute_y,
+            "absolute_x_source": self.absolute_x_source,
+            "absolute_y_source": self.absolute_y_source,
             "continuous": self.continuous,
         }
 
@@ -259,8 +280,62 @@ class MappingAction:
         if self.type == "mouse_move":
             return f"move x={self.speed_x:g}/s y={self.speed_y:g}/s"
         if self.type == "mouse_absolute":
+            if self.absolute_x_source or self.absolute_y_source:
+                x_source = self.absolute_x_source or f"{self.absolute_x:.2f}"
+                y_source = self.absolute_y_source or f"{self.absolute_y:.2f}"
+                return f"follow {x_source},{y_source}"
             return f"move absolute {self.absolute_x:.2f},{self.absolute_y:.2f}"
         return self.type
+
+
+@dataclass
+class MappingCondition:
+    source: str = ""
+    comparator: str = "truthy"
+    threshold: Any = True
+    low: Any = 0.0
+    high: Any = 1.0
+    hysteresis: float = 0.0
+    output_keys: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MappingCondition":
+        if not isinstance(data, dict):
+            raise ValueError("mapping condition must be an object")
+        comparator = str(data.get("comparator", "truthy"))
+        if comparator not in STANDARD_COMPARATORS:
+            raise ValueError(f"unknown condition comparator: {comparator}")
+        return cls(
+            source=str(data.get("source") or ""),
+            comparator=comparator,
+            threshold=data.get("threshold", True),
+            low=data.get("low", 0.0),
+            high=data.get("high", 1.0),
+            hysteresis=max(0.0, float(data.get("hysteresis", 0.0) or 0.0)),
+            output_keys=parse_key_combo(data.get("output_keys", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "comparator": self.comparator,
+            "threshold": self.threshold,
+            "low": self.low,
+            "high": self.high,
+            "hysteresis": self.hysteresis,
+            "output_keys": list(self.output_keys),
+        }
+
+    def summary(self) -> str:
+        if self.comparator in {"present", "truthy", "falsey"}:
+            summary = f"{self.source} {self.comparator}"
+        elif self.comparator in {"between", "outside"}:
+            summary = f"{self.source} {self.comparator} {self.low}..{self.high}"
+        else:
+            summary = f"{self.source} {self.comparator} {self.threshold}"
+        if self.output_keys:
+            summary += f" -> hold {'+'.join(self.output_keys)}"
+        return summary
 
 
 @dataclass
@@ -275,6 +350,13 @@ class MappingRule:
     high: Any = 1.0
     hysteresis: float = 0.0
     debounce_ms: int = 0
+    gate_source: str = ""
+    gate_comparator: str = "truthy"
+    gate_threshold: Any = True
+    gate_low: Any = 0.0
+    gate_high: Any = 1.0
+    conditions: list[MappingCondition] = field(default_factory=list)
+    recognition_label: str = ""
     action: MappingAction = field(default_factory=MappingAction)
 
     @classmethod
@@ -284,6 +366,9 @@ class MappingRule:
         comparator = str(data.get("comparator", "lt"))
         if comparator not in COMPARATORS:
             raise ValueError(f"unknown comparator: {comparator}")
+        gate_comparator = str(data.get("gate_comparator", "truthy"))
+        if gate_comparator not in STANDARD_COMPARATORS:
+            raise ValueError(f"unknown gate comparator: {gate_comparator}")
         return cls(
             id=str(data.get("id") or uuid.uuid4().hex),
             name=str(data.get("name") or "Mapping"),
@@ -295,6 +380,17 @@ class MappingRule:
             high=data.get("high", 1.0),
             hysteresis=max(0.0, float(data.get("hysteresis", 0.0) or 0.0)),
             debounce_ms=max(0, int(float(data.get("debounce_ms", 0) or 0))),
+            gate_source=str(data.get("gate_source") or ""),
+            gate_comparator=gate_comparator,
+            gate_threshold=data.get("gate_threshold", True),
+            gate_low=data.get("gate_low", 0.0),
+            gate_high=data.get("gate_high", 1.0),
+            conditions=[
+                MappingCondition.from_dict(item)
+                for item in data.get("conditions", [])
+                if isinstance(item, dict)
+            ],
+            recognition_label=str(data.get("recognition_label") or ""),
             action=MappingAction.from_dict(data.get("action", {})),
         )
 
@@ -310,15 +406,45 @@ class MappingRule:
             "high": self.high,
             "hysteresis": self.hysteresis,
             "debounce_ms": self.debounce_ms,
+            "gate_source": self.gate_source,
+            "gate_comparator": self.gate_comparator,
+            "gate_threshold": self.gate_threshold,
+            "gate_low": self.gate_low,
+            "gate_high": self.gate_high,
+            "conditions": [condition.to_dict() for condition in self.conditions],
+            "recognition_label": self.recognition_label,
             "action": self.action.to_dict(),
         }
 
+    def all_conditions(self) -> list[MappingCondition]:
+        conditions = list(self.conditions)
+        if self.gate_source:
+            conditions.append(
+                MappingCondition(
+                    source=self.gate_source,
+                    comparator=self.gate_comparator,
+                    threshold=self.gate_threshold,
+                    low=self.gate_low,
+                    high=self.gate_high,
+                    hysteresis=self.hysteresis,
+                )
+            )
+        return conditions
+
     def condition_summary(self) -> str:
-        if self.comparator in {"present", "truthy", "falsey"}:
-            return self.comparator
-        if self.comparator in {"between", "outside"}:
-            return f"{self.comparator} {self.low}..{self.high}"
-        return f"{self.comparator} {self.threshold}"
+        if self.comparator in {"delta_decrease", "delta_increase"}:
+            direction = "decrease" if self.comparator == "delta_decrease" else "increase"
+            summary = f"{direction} by {self.threshold}"
+        elif self.comparator in {"present", "truthy", "falsey"}:
+            summary = self.comparator
+        elif self.comparator in {"between", "outside"}:
+            summary = f"{self.comparator} {self.low}..{self.high}"
+        else:
+            summary = f"{self.comparator} {self.threshold}"
+        conditions = [condition.summary() for condition in self.all_conditions() if condition.source]
+        if conditions:
+            return f"{summary} when {' + '.join(conditions)}"
+        return summary
 
 
 @dataclass
@@ -354,6 +480,7 @@ class MappingConfig:
         profiles = [MappingProfile.from_dict(item) for item in data.get("profiles", [])]
         if not profiles:
             profiles = [MappingProfile()]
+        _upgrade_wrist_pitch_rules(profiles)
         active_profile = str(data.get("active_profile") or profiles[0].name)
         if active_profile not in {profile.name for profile in profiles}:
             active_profile = profiles[0].name
@@ -387,11 +514,35 @@ def default_mapping_config() -> MappingConfig:
     return MappingConfig()
 
 
+def _upgrade_wrist_pitch_rules(profiles: list[MappingProfile]) -> None:
+    for profile in profiles:
+        for rule in profile.mappings:
+            if rule.source != "fused.wrist_pitch_delta":
+                continue
+            if not any(condition.source == "fused.wrist_pitch_dominant" for condition in rule.all_conditions()):
+                continue
+            try:
+                threshold = float(rule.threshold)
+            except (TypeError, ValueError):
+                continue
+            if rule.comparator == "gt" and threshold > 0:
+                rule.source = "fused.wrist_pitch_up_detected"
+            elif rule.comparator == "lt" and threshold < 0:
+                rule.source = "fused.wrist_pitch_down_detected"
+            else:
+                continue
+            rule.comparator = "truthy"
+            rule.threshold = True
+            rule.low = 0.0
+            rule.high = 1.0
+            rule.hysteresis = 0.0
+
+
 def load_mapping_config(path: Path = DEFAULT_MAPPING_PATH) -> tuple[MappingConfig, str | None]:
     if not path.exists():
         return default_mapping_config(), None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         return MappingConfig.from_dict(data), None
     except Exception as exc:
         return default_mapping_config(), str(exc)
@@ -407,6 +558,7 @@ class _RuntimeState:
     active: bool = False
     pending_desired: bool | None = None
     pending_since_s: float = 0.0
+    enter_blocked: bool = False
     last_fired_s: float | None = None
     last_repeat_s: float = 0.0
     last_process_s: float | None = None
@@ -431,6 +583,10 @@ class InputMapper:
         self._held_buttons: dict[str, set[str]] = {}
         self._rule_keys: dict[str, set[str]] = {}
         self._rule_buttons: dict[str, set[str]] = {}
+        self._delta_anchors: dict[tuple[Any, ...], float] = {}
+        self._gesture_last_fired: dict[str, float] = {}
+        self._last_recognition_label = ""
+        self._last_recognition_s = 0.0
         self._last_status = "armed" if self.enabled else "disabled"
 
     @property
@@ -453,6 +609,7 @@ class InputMapper:
         self.config = config
         self.enabled = bool(config.enabled_on_start)
         self._states.clear()
+        self._gesture_last_fired.clear()
 
     def set_active_profile(self, profile_name: str) -> bool:
         if profile_name not in self.config.profile_names():
@@ -461,10 +618,19 @@ class InputMapper:
             self.release_all()
             self.config.active_profile = profile_name
             self._states.clear()
+            self._gesture_last_fired.clear()
         return True
 
     def active_rules(self) -> list[MappingRule]:
         return self.config.active().mappings
+
+    def last_recognition(self, max_age_s: float = 1.2, now_s: float | None = None) -> str:
+        now_s = time.monotonic() if now_s is None else now_s
+        if not self._last_recognition_label:
+            return ""
+        if now_s - self._last_recognition_s > max(0.0, max_age_s):
+            return ""
+        return self._last_recognition_label
 
     def process(self, snapshot: dict[str, Any], now_s: float | None = None, suppress_output: bool = False) -> None:
         now_s = time.monotonic() if now_s is None else now_s
@@ -491,22 +657,33 @@ class InputMapper:
             state = self._states.setdefault(rule.id, _RuntimeState())
             if not rule.enabled or not rule.source:
                 self._transition(rule, state, False, now_s)
+                self.release_rule(rule.id)
+                self._reset_delta_anchor(rule)
                 state.status = "disabled" if not rule.enabled else "no source"
+                continue
+            condition_results = self._sync_condition_outputs(rule, signals, state)
+            conditions_active, conditions_status = self._conditions_active(rule, signals, state, condition_results)
+            if not conditions_active:
+                state.pending_desired = None
+                self._transition(rule, state, False, now_s)
+                self._reset_delta_anchor(rule)
+                state.status = conditions_status
                 continue
             signal = signals.get(rule.source)
             if signal is None or signal.value is None:
                 state.pending_desired = None
                 self._transition(rule, state, False, now_s)
+                self._reset_delta_anchor(rule)
                 state.status = "missing"
                 continue
 
-            desired = evaluate_condition(rule, signal.value, state.active)
+            desired = self._desired_condition(rule, signal.value, state)
             active = self._debounced_active(rule, state, desired, now_s)
-            self._transition(rule, state, active, now_s, signal.value)
+            self._transition(rule, state, active, now_s, signal.value, signals)
             state.status = "active" if state.active else "idle"
 
         for rule_id, state in list(self._states.items()):
-            if rule_id not in live_rule_ids and state.active:
+            if rule_id not in live_rule_ids:
                 self.release_rule(rule_id)
                 state.active = False
                 state.status = "removed"
@@ -516,25 +693,37 @@ class InputMapper:
     def has_held_outputs(self) -> bool:
         return bool(self._held_keys or self._held_buttons)
 
-    def release_rule(self, rule_id: str) -> None:
-        for token in list(self._rule_keys.get(rule_id, set())):
+    def release_rule(self, rule_id: str, *, include_modifiers: bool = True) -> None:
+        holder_ids = [rule_id]
+        if include_modifiers:
+            prefix = f"{rule_id}:modifier:"
+            holder_ids.extend(
+                holder_id
+                for holder_id in set(self._rule_keys) | set(self._rule_buttons)
+                if holder_id.startswith(prefix)
+            )
+        for holder_id in holder_ids:
+            self._release_holder(holder_id)
+
+    def _release_holder(self, holder_id: str) -> None:
+        for token in list(self._rule_keys.get(holder_id, set())):
             holders = self._held_keys.get(token)
             if not holders:
                 continue
-            holders.discard(rule_id)
+            holders.discard(holder_id)
             if not holders:
                 self.backend.release_key(token)
                 self._held_keys.pop(token, None)
-        for button in list(self._rule_buttons.get(rule_id, set())):
+        for button in list(self._rule_buttons.get(holder_id, set())):
             holders = self._held_buttons.get(button)
             if not holders:
                 continue
-            holders.discard(rule_id)
+            holders.discard(holder_id)
             if not holders:
                 self.backend.release_mouse(button)
                 self._held_buttons.pop(button, None)
-        self._rule_keys.pop(rule_id, None)
-        self._rule_buttons.pop(rule_id, None)
+        self._rule_keys.pop(holder_id, None)
+        self._rule_buttons.pop(holder_id, None)
 
     def release_all(self) -> None:
         for token in list(self._held_keys.keys()):
@@ -545,9 +734,11 @@ class InputMapper:
         self._held_buttons.clear()
         self._rule_keys.clear()
         self._rule_buttons.clear()
+        self._delta_anchors.clear()
         for state in self._states.values():
             state.active = False
             state.pending_desired = None
+            state.enter_blocked = False
             state.status = "idle"
 
     def test_action(self, action: MappingAction) -> None:
@@ -560,7 +751,7 @@ class InputMapper:
         if action.type == "mouse_hold":
             self.backend.click_mouse(action.button, 1)
             return
-        self._execute_enter("__test__", action, time.monotonic())
+        self._execute_enter(MappingRule(id="__test__", name="Test action", action=action), action, time.monotonic())
 
     def state_for_rule(self, rule_id: str) -> _RuntimeState:
         return self._states.setdefault(rule_id, _RuntimeState())
@@ -569,7 +760,7 @@ class InputMapper:
         if desired == state.active:
             state.pending_desired = None
             return state.active
-        debounce_s = rule.debounce_ms / 1000.0
+        debounce_s = 0.0 if self._gesture_name_for_rule(rule) else rule.debounce_ms / 1000.0
         if debounce_s <= 0:
             state.pending_desired = None
             return desired
@@ -589,23 +780,48 @@ class InputMapper:
         active: bool,
         now_s: float,
         source_value: Any = None,
+        signals: dict[str, SignalValue] | None = None,
     ) -> None:
         if active and not state.active:
+            gesture_name = self._gesture_name_for_rule(rule)
             state.active = True
             state.last_process_s = now_s
             state.residual_x = 0.0
             state.residual_y = 0.0
-            self._execute_enter(rule.id, rule.action, now_s)
+            state.enter_blocked = bool(gesture_name and not self._can_fire_gesture(gesture_name, now_s))
+            if state.enter_blocked:
+                state.status = "gesture cooldown"
+                return
+            self._execute_enter(rule, rule.action, now_s)
         elif not active and state.active:
             state.active = False
             state.last_process_s = None
-            self.release_rule(rule.id)
+            state.enter_blocked = False
+            self.release_rule(rule.id, include_modifiers=False)
             return
 
-        if state.active:
-            self._execute_active(rule.id, rule.action, state, now_s, source_value)
+        if state.active and not state.enter_blocked:
+            self._execute_active(rule.id, rule.action, state, now_s, source_value, signals or {})
 
-    def _execute_enter(self, rule_id: str, action: MappingAction, now_s: float) -> None:
+    def _gesture_name_for_rule(self, rule: MappingRule) -> str | None:
+        gesture_name = WRIST_GESTURE_SIGNAL_NAMES.get(rule.source)
+        if gesture_name:
+            return gesture_name
+        if rule.source == "fused.wrist_motion" and rule.comparator == "eq":
+            threshold = str(rule.threshold).strip().lower()
+            if threshold and threshold != "none":
+                return f"wrist_motion:{threshold}"
+        return None
+
+    def _can_fire_gesture(self, name: str, now_s: float) -> bool:
+        last = self._gesture_last_fired.get(name)
+        if last is None or now_s - last >= GESTURE_COOLDOWN_SEC:
+            self._gesture_last_fired[name] = now_s
+            return True
+        return False
+
+    def _execute_enter(self, rule: MappingRule, action: MappingAction, now_s: float) -> None:
+        rule_id = rule.id
         if action.type == "keyboard_tap":
             self.backend.tap_keys(action.keys)
         elif action.type == "keyboard_hold":
@@ -618,11 +834,122 @@ class InputMapper:
             self._hold_mouse(rule_id, action.button)
         elif action.type == "mouse_scroll":
             self.backend.scroll(action.scroll_x, action.scroll_y)
-        elif action.type == "mouse_absolute":
+        elif action.type == "mouse_absolute" and not action.continuous:
             self._move_absolute(action)
         state = self._states.setdefault(rule_id, _RuntimeState())
         state.last_fired_s = now_s
         state.last_repeat_s = now_s
+        if rule.recognition_label:
+            self._last_recognition_label = rule.recognition_label
+            self._last_recognition_s = now_s
+
+    def _sync_condition_outputs(
+        self,
+        rule: MappingRule,
+        signals: dict[str, SignalValue],
+        state: _RuntimeState,
+    ) -> list[tuple[MappingCondition, bool, str]]:
+        results: list[tuple[MappingCondition, bool, str]] = []
+        for index, condition in enumerate(condition for condition in rule.all_conditions() if condition.source):
+            active, status = self._condition_active(condition, signals, state)
+            holder_id = self._modifier_holder_id(rule.id, index)
+            if active and condition.output_keys:
+                self._hold_keys(holder_id, condition.output_keys)
+            else:
+                self.release_rule(holder_id, include_modifiers=False)
+            results.append((condition, active, status))
+        return results
+
+    @staticmethod
+    def _modifier_holder_id(rule_id: str, index: int) -> str:
+        return f"{rule_id}:modifier:{index}"
+
+    def _condition_active(
+        self,
+        condition: MappingCondition,
+        signals: dict[str, SignalValue],
+        state: _RuntimeState,
+    ) -> tuple[bool, str]:
+        signal = signals.get(condition.source)
+        if signal is None or signal.value is None:
+            return False, "condition missing"
+        active = _evaluate_standard_condition(
+            condition.comparator,
+            signal.value,
+            condition.threshold,
+            condition.low,
+            condition.high,
+            condition.hysteresis,
+            state.active,
+        )
+        return active, "conditions active" if active else "condition idle"
+
+    def _conditions_active(
+        self,
+        rule: MappingRule,
+        signals: dict[str, SignalValue],
+        state: _RuntimeState,
+        condition_results: list[tuple[MappingCondition, bool, str]] | None = None,
+    ) -> tuple[bool, str]:
+        results = condition_results
+        if results is None:
+            results = [
+                (condition, *self._condition_active(condition, signals, state))
+                for condition in rule.all_conditions()
+                if condition.source
+            ]
+        if not results:
+            return True, ""
+        for _condition, active, status in results:
+            if not active:
+                return False, status
+        return True, "conditions active"
+
+    def _desired_condition(self, rule: MappingRule, value: Any, state: _RuntimeState) -> bool:
+        if rule.comparator in DELTA_COMPARATORS:
+            return self._evaluate_delta_condition(rule, value)
+        return evaluate_condition(rule, value, state.active)
+
+    def _evaluate_delta_condition(self, rule: MappingRule, value: Any) -> bool:
+        number = _to_number(value)
+        threshold = _to_number(rule.threshold)
+        if number is None or threshold is None or threshold <= 0.0:
+            self._reset_delta_anchor(rule)
+            return False
+        key = self._delta_anchor_key(rule)
+        anchor = self._delta_anchors.get(key)
+        if anchor is None:
+            self._delta_anchors[key] = number
+            return False
+        delta = number - anchor
+        if rule.comparator == "delta_decrease" and delta <= -threshold:
+            self._delta_anchors[key] = number
+            return True
+        if rule.comparator == "delta_increase" and delta >= threshold:
+            self._delta_anchors[key] = number
+            return True
+        return False
+
+    def _delta_anchor_key(self, rule: MappingRule) -> tuple[Any, ...]:
+        conditions = tuple(
+            (
+                condition.source,
+                condition.comparator,
+                str(condition.threshold),
+                str(condition.low),
+                str(condition.high),
+            )
+            for condition in rule.all_conditions()
+            if condition.source
+        )
+        return (
+            rule.source,
+            conditions,
+        )
+
+    def _reset_delta_anchor(self, rule: MappingRule) -> None:
+        if rule.comparator in DELTA_COMPARATORS:
+            self._delta_anchors.pop(self._delta_anchor_key(rule), None)
 
     def _execute_active(
         self,
@@ -631,6 +958,7 @@ class InputMapper:
         state: _RuntimeState,
         now_s: float,
         source_value: Any,
+        signals: dict[str, SignalValue],
     ) -> None:
         interval_s = max(0.02, action.interval_ms / 1000.0)
         if action.type == "keyboard_repeat" and now_s - state.last_repeat_s >= interval_s:
@@ -647,7 +975,7 @@ class InputMapper:
             state.last_process_s = now_s
             self._move_relative(action, state, dt, now_s)
         elif action.type == "mouse_absolute" and action.continuous:
-            self._move_absolute(action)
+            self._move_absolute(action, signals)
             state.last_fired_s = now_s
 
     def _hold_keys(self, rule_id: str, tokens: list[str]) -> None:
@@ -679,7 +1007,11 @@ class InputMapper:
             self.backend.move(step_x, step_y)
             state.last_fired_s = now_s
 
-    def _move_absolute(self, action: MappingAction) -> None:
+    def _move_absolute(
+        self,
+        action: MappingAction,
+        signals: dict[str, SignalValue] | None = None,
+    ) -> None:
         try:
             import tkinter as tk
 
@@ -688,9 +1020,24 @@ class InputMapper:
             height = root.winfo_screenheight() if root is not None else 1080
         except Exception:
             width, height = 1920, 1080
-        x = int(max(0.0, min(1.0, action.absolute_x)) * max(1, width - 1))
-        y = int(max(0.0, min(1.0, action.absolute_y)) * max(1, height - 1))
+        absolute_x = self._absolute_axis_value(action.absolute_x, action.absolute_x_source, signals)
+        absolute_y = self._absolute_axis_value(action.absolute_y, action.absolute_y_source, signals)
+        x = int(max(0.0, min(1.0, absolute_x)) * max(1, width - 1))
+        y = int(max(0.0, min(1.0, absolute_y)) * max(1, height - 1))
         self.backend.move_absolute(x, y)
+
+    @staticmethod
+    def _absolute_axis_value(
+        fallback: float,
+        source: str,
+        signals: dict[str, SignalValue] | None,
+    ) -> float:
+        if source and signals:
+            signal = signals.get(source)
+            number = _to_number(signal.value) if signal is not None else None
+            if number is not None:
+                return number
+        return fallback
 
     def _log(self, message: str) -> None:
         if self.on_log:
@@ -698,8 +1045,29 @@ class InputMapper:
 
 
 def evaluate_condition(rule: MappingRule, value: Any, was_active: bool = False) -> bool:
-    comparator = rule.comparator
-    hysteresis = max(0.0, float(rule.hysteresis or 0.0))
+    if rule.comparator in DELTA_COMPARATORS:
+        return False
+    return _evaluate_standard_condition(
+        rule.comparator,
+        value,
+        rule.threshold,
+        rule.low,
+        rule.high,
+        rule.hysteresis,
+        was_active,
+    )
+
+
+def _evaluate_standard_condition(
+    comparator: str,
+    value: Any,
+    threshold_value: Any,
+    low_value: Any,
+    high_value: Any,
+    hysteresis_value: float,
+    was_active: bool = False,
+) -> bool:
+    hysteresis = max(0.0, float(hysteresis_value or 0.0))
     if comparator == "present":
         return value is not None and value != ""
     if comparator == "truthy":
@@ -707,15 +1075,15 @@ def evaluate_condition(rule: MappingRule, value: Any, was_active: bool = False) 
     if comparator == "falsey":
         return not bool(value)
     if comparator in {"eq", "neq"}:
-        same = _compare_equal(value, rule.threshold)
+        same = _compare_equal(value, threshold_value)
         return same if comparator == "eq" else not same
 
     number = _to_number(value)
     if number is None:
         return False
-    threshold = _to_number(rule.threshold)
-    low = _to_number(rule.low)
-    high = _to_number(rule.high)
+    threshold = _to_number(threshold_value)
+    low = _to_number(low_value)
+    high = _to_number(high_value)
     if comparator in {"lt", "lte", "gt", "gte"} and threshold is None:
         return False
     if comparator in {"between", "outside"} and (low is None or high is None):

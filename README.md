@@ -131,9 +131,9 @@ The GUI provides:
 - keyboard ToF live data and a 0-300 mm distance grid
 - camera center command
 - servo calibration save/load
-- labeled gesture recording under the user's AirTrixx app-data folder
+- labeled gesture recording under `python_app/data/gestures`
 
-Runtime config, mappings, logs, gesture recordings, and temporary audio files are stored outside the app bundle:
+Runtime config, mappings, logs, and temporary audio files are stored outside the app bundle:
 
 - Windows: `%APPDATA%\AirTrixx`
 - macOS: `~/Library/Application Support/AirTrixx`
@@ -153,6 +153,8 @@ Windows x64 installer or portable zip:
 ```
 
 The build scripts install dependencies into an isolated build venv, generate icons, download the MediaPipe hand-landmarker model into generated packaging assets, and run PyInstaller. Windows builds must be produced on Windows; macOS DMGs must be produced on macOS.
+
+On Windows, the installer registers `AirTrixx.exe` with the high-performance GPU preference under the current user's graphics settings. Portable zip builds self-register this preference on first launch and need one restart before Windows applies it. OpenCV OpenCL acceleration is enabled at startup when the installed OpenCV build and GPU driver support it. MediaPipe 0.10.9's Python GPU delegate is not supported on Windows, so hand landmark inference still falls back to CPU on Windows builds.
 
 To run the smaller connection status checker without camera or MediaPipe:
 
