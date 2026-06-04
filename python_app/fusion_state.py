@@ -25,6 +25,12 @@ WRIST_TRAINED_LEFT_PITCH_DEG = 35.0
 WRIST_TRAINED_LEFT_ROLL_LIMIT_DEG = 45.0
 WRIST_TRAINED_LEFT_AXIS_RATIO = 1.35
 WRIST_TRAINED_LEFT_DECISION_S = 0.35
+WRIST_SAMPLED_LEFT_ROLL_DEG = 90.0
+WRIST_SAMPLED_LEFT_PITCH_DEG = 55.0
+WRIST_SAMPLED_LEFT_CURRENT_DEG = 65.0
+WRIST_SAMPLED_LEFT_DECISION_S = 1.0
+WRIST_SAMPLED_LEFT_AXIS_RATIO = 1.05
+WRIST_SAMPLED_LEFT_STABLE_RATIO = 0.65
 WRIST_PITCH_GESTURE_DEG = 30.0
 WRIST_PITCH_GESTURE_HELD_DEG = 25.0
 WRIST_PITCH_DECISION_S = 0.35
@@ -135,6 +141,24 @@ class FusionState:
     @staticmethod
     def _angle_delta(current: float, anchor: float) -> float:
         return (current - anchor + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _unwrap_angle_samples(samples: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if not samples:
+            return []
+        unwrapped: list[tuple[float, float]] = []
+        previous = samples[0][1]
+        offset = 0.0
+        for index, (sample_s, value) in enumerate(samples):
+            if index:
+                step = value - previous
+                if step > 180.0:
+                    offset -= 360.0
+                elif step < -180.0:
+                    offset += 360.0
+            unwrapped.append((sample_s, value + offset))
+            previous = value
+        return unwrapped
 
     @staticmethod
     def _median(values: list[float]) -> float | None:
@@ -405,11 +429,30 @@ class FusionState:
                 "wrist_roll_event_pulse_active": False,
             }
 
+        raw_roll_samples = [(item[0], item[2]) for item in self._wrist_motion_history]
+        unwrapped_roll_samples = self._unwrap_angle_samples(raw_roll_samples)
+        baseline_unwrapped_roll_values = [
+            value
+            for sample_s, value in unwrapped_roll_samples
+            if sample_s <= baseline_end_s
+        ]
+        current_unwrapped_roll_values = [
+            value
+            for sample_s, value in unwrapped_roll_samples
+            if sample_s >= current_start_s
+        ]
+        baseline_roll_unwrapped = self._median(baseline_unwrapped_roll_values) or baseline_roll
+        current_roll_unwrapped = self._median(current_unwrapped_roll_values) or current_roll
         roll_delta_samples = [
             (item[0], self._angle_delta(item[2], baseline_roll))
             for item in self._wrist_motion_history
         ]
+        roll_unwrapped_delta_samples = [
+            (sample_s, value - baseline_roll_unwrapped)
+            for sample_s, value in unwrapped_roll_samples
+        ]
         roll_deltas = [delta for _t, delta in roll_delta_samples]
+        roll_unwrapped_deltas = [delta for _t, delta in roll_unwrapped_delta_samples]
         pitch_deltas = [self._angle_delta(item[1], baseline_pitch) for item in self._wrist_motion_history]
         pitch_delta_samples = [
             (item[0], self._angle_delta(item[1], baseline_pitch))
@@ -419,12 +462,20 @@ class FusionState:
         roll_high = self._percentile(roll_deltas, 0.95) or 0.0
         pitch_low = self._percentile(pitch_deltas, 0.05) or 0.0
         pitch_high = self._percentile(pitch_deltas, 0.95) or 0.0
+        roll_unwrapped_low = self._percentile(roll_unwrapped_deltas, 0.05) or 0.0
+        roll_unwrapped_high = self._percentile(roll_unwrapped_deltas, 0.95) or 0.0
         roll_abs_delta = max(abs(roll_low), abs(roll_high))
+        roll_abs_delta_unwrapped = max(abs(roll_unwrapped_low), abs(roll_unwrapped_high))
         pitch_abs_delta = max(abs(pitch_low), abs(pitch_high))
         roll_delta = self._angle_delta(current_roll, baseline_roll)
+        roll_delta_unwrapped = current_roll_unwrapped - baseline_roll_unwrapped
         pitch_delta = self._angle_delta(current_pitch, baseline_pitch)
         roll_velocity = self._velocity_profile(
-            [(item[0], item[2]) for item in self._wrist_motion_history],
+            raw_roll_samples,
+            now_s,
+        )
+        roll_unwrapped_velocity = self._velocity_profile(
+            unwrapped_roll_samples,
             now_s,
         )
         pitch_velocity = self._velocity_profile(
@@ -449,6 +500,12 @@ class FusionState:
             if sample_s >= now_s - WRIST_TRAINED_ROLL_CURRENT_S
         ]
         current_roll_abs_deltas = [abs(sample_delta) for sample_delta in current_roll_deltas]
+        current_roll_unwrapped_deltas = [
+            sample_delta
+            for sample_s, sample_delta in roll_unwrapped_delta_samples
+            if sample_s >= now_s - WRIST_TRAINED_ROLL_CURRENT_S
+        ]
+        current_roll_abs_unwrapped_deltas = [abs(sample_delta) for sample_delta in current_roll_unwrapped_deltas]
         roll_neutral_fraction = (
             sum(1 for sample_delta in current_roll_abs_deltas if sample_delta <= WRIST_TRAINED_ROLL_RETURN_DEG)
             / len(current_roll_abs_deltas)
@@ -456,6 +513,7 @@ class FusionState:
             else 0.0
         )
         current_roll_abs_median = self._median(current_roll_abs_deltas) or 0.0
+        current_roll_abs_unwrapped_median = self._median(current_roll_abs_unwrapped_deltas) or 0.0
         stable_roll_return = bool(current_roll_abs_deltas) and (
             current_roll_abs_median <= WRIST_TRAINED_ROLL_RETURN_DEG
             and roll_neutral_fraction >= WRIST_TRAINED_ROLL_RETURN_NEUTRAL_RATIO
@@ -468,6 +526,15 @@ class FusionState:
             )
             / len(current_roll_deltas)
             >= 0.75
+        )
+        stable_sampled_left_hold = bool(current_roll_abs_unwrapped_deltas) and (
+            sum(
+                1
+                for sample_delta in current_roll_abs_unwrapped_deltas
+                if sample_delta >= WRIST_SAMPLED_LEFT_CURRENT_DEG
+            )
+            / len(current_roll_abs_unwrapped_deltas)
+            >= WRIST_SAMPLED_LEFT_STABLE_RATIO
         )
         roll_hold_retention = abs(roll_delta) / max(roll_abs_delta, 1.0)
         roll_axis_clear = roll_abs_delta >= max(
@@ -510,6 +577,16 @@ class FusionState:
             first_large_left_pitch_s is not None
             and now_s - first_large_left_pitch_s >= WRIST_TRAINED_LEFT_DECISION_S
         )
+        sampled_left_large_roll_times = [
+            sample_s
+            for sample_s, sample_delta in roll_unwrapped_delta_samples
+            if abs(sample_delta) >= WRIST_SAMPLED_LEFT_ROLL_DEG
+        ]
+        first_sampled_left_large_roll_s = min(sampled_left_large_roll_times) if sampled_left_large_roll_times else None
+        sampled_left_decision_ready = (
+            first_sampled_left_large_roll_s is not None
+            and now_s - first_sampled_left_large_roll_s >= WRIST_SAMPLED_LEFT_DECISION_S
+        )
         pitch_up_times = [
             sample_s
             for sample_s, sample_delta in pitch_delta_samples
@@ -539,11 +616,27 @@ class FusionState:
         pitch_up_ready = bool(pitch_up_times) and now_s - min(pitch_up_times) >= WRIST_PITCH_DECISION_S
         pitch_down_ready = bool(pitch_down_times) and now_s - min(pitch_down_times) >= WRIST_PITCH_DECISION_S
 
+        sampled_roll_left_early_active = (
+            pitch_abs_delta >= WRIST_SAMPLED_LEFT_PITCH_DEG
+            and roll_abs_delta_unwrapped >= max(
+                WRIST_SAMPLED_LEFT_ROLL_DEG,
+                pitch_abs_delta * WRIST_SAMPLED_LEFT_AXIS_RATIO,
+            )
+            and current_roll_abs_unwrapped_median >= WRIST_SAMPLED_LEFT_CURRENT_DEG
+            and stable_sampled_left_hold
+        )
         raw_roll_right_then_neutral = (
             roll_axis_clear
             and stable_roll_return
             and roll_return_ready
+            and not sampled_roll_left_early_active
             and roll_velocity["velocity_peak_dps"] >= WRIST_VELOCITY_MIN_PEAK_DPS
+        )
+        sampled_roll_left_candidate_active = (
+            not raw_roll_right_then_neutral
+            and sampled_roll_left_early_active
+            and sampled_left_decision_ready
+            and roll_unwrapped_velocity["velocity_peak_dps"] >= WRIST_VELOCITY_MIN_PEAK_DPS
         )
         roll_left_candidate_active = (
             not raw_roll_right_then_neutral
@@ -553,11 +646,20 @@ class FusionState:
             and roll_abs_delta <= WRIST_TRAINED_LEFT_ROLL_LIMIT_DEG
             and pitch_velocity["velocity_peak_dps"] >= WRIST_VELOCITY_MIN_PEAK_DPS
         )
+        sampled_roll_left = self._peak_trigger(
+            "sampled_roll_left",
+            current_roll_abs_unwrapped_median,
+            WRIST_SAMPLED_LEFT_CURRENT_DEG,
+            sampled_roll_left_candidate_active,
+            now_s,
+        )
         roll_right = self._peak_trigger(
             "roll_right",
             abs(roll_delta),
             WRIST_TRAINED_ROLL_HELD_DEG,
             not raw_roll_right_then_neutral
+            and not sampled_roll_left
+            and not sampled_roll_left_candidate_active
             and roll_axis_clear
             and stable_roll_hold
             and roll_hold_retention >= WRIST_TRAINED_ROLL_HOLD_RETENTION_RATIO
@@ -566,15 +668,18 @@ class FusionState:
             now_s,
         )
         roll_right_then_neutral = raw_roll_right_then_neutral
-        roll_left = self._peak_trigger(
+        pitch_style_roll_left = self._peak_trigger(
             "roll_left",
             max(0.0, -pitch_delta),
             WRIST_TRAINED_LEFT_PITCH_DEG,
             not roll_right_then_neutral
             and not roll_right
+            and not sampled_roll_left
+            and not sampled_roll_left_candidate_active
             and roll_left_candidate_active,
             now_s,
         )
+        roll_left = sampled_roll_left or pitch_style_roll_left
         pitch_up = self._peak_trigger(
             "pitch_up",
             max(0.0, pitch_delta),

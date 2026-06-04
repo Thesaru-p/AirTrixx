@@ -78,6 +78,7 @@ CAMERA_POPUP_MARGIN = 18
 CAMERA_OVERLAY_MAX_LINES = 4
 SERIAL_AUTOCONNECT_DELAY_MS = 250
 SERIAL_AUTOCONNECT_RETRY_MS = 1000
+SERIAL_PORT_FAIL_COOLDOWN_S = 8.0
 LIVE_DATA_HISTORY_ROWS = 10
 KEYBOARD_DISTANCE_ROWS = 30
 KEYBOARD_DISTANCE_BAND_MM = 10
@@ -256,6 +257,7 @@ class AirTrixxGUI:
         self.servo_debug_lines: list[str] = []
         self.nav_buttons: dict[str, ttk.Button] = {}
         self.pages: dict[str, ttk.Frame] = {}
+        self.dashboard_battery_cards: dict[str, dict[str, Any]] = {}
         self.keyboard_cells: list[list[tk.Label]] = []
         self.keyboard_status_var = tk.StringVar(value="Keyboard: waiting for ToF data.")
         self.hub_status_var = tk.StringVar(value="Hub: disconnected")
@@ -266,6 +268,7 @@ class AirTrixxGUI:
         self.camera_popup: tk.Toplevel | None = None
         self.camera_popup_label: ttk.Label | None = None
         self._popup_photo: tk.PhotoImage | None = None
+        self.camera_popup_dismissed = False
         self._last_servo_debug_sequence = 0
         self._last_servo_debug_log_s = 0.0
         self.ota_server: http.server.ThreadingHTTPServer | None = None
@@ -273,6 +276,10 @@ class AirTrixxGUI:
         self.ota_in_progress = False
         self.fans_requested_on = False
         self.serial_autoconnect_enabled = True
+        self.serial_connect_in_progress = False
+        self._serial_connect_generation = 0
+        self._serial_failed_until: dict[str, float] = {}
+        self._serial_last_port_scan: list[dict[str, str]] = []
         self.camera_centering_active = True
         self.camera_centering_started_s: float | None = None
         self.camera_centering_settled_s: float | None = None
@@ -325,6 +332,7 @@ class AirTrixxGUI:
         self.input_mapper = InputMapper(self.input_backend, mapping_config, on_log=self.log)
         self.mapping_recording_shortcut = False
         self.mapping_signal_items: dict[str, str] = {}
+        self.mapping_signal_group_items: dict[str, str] = {}
         self.mapping_rule_items: dict[str, str] = {}
         self.mapping_enabled_var = tk.BooleanVar(value=self.input_mapper.enabled)
         self.mapping_start_enabled_var = tk.BooleanVar(value=mapping_config.enabled_on_start)
@@ -344,6 +352,7 @@ class AirTrixxGUI:
         self.testing_selected_id = ""
         self.testing_last_label = ""
         self.testing_last_seen_s = 0.0
+        self._last_runtime_perf_settings: tuple[int, int, int, bool] | None = None
         if mapping_error:
             self.log(f"Input mappings reset because config could not be loaded: {mapping_error}")
         if self.input_backend.error:
@@ -362,7 +371,6 @@ class AirTrixxGUI:
         self._apply_runtime_performance_settings()
         self.refresh_ports()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
-        self.root.after(500, self._ensure_camera_popup)
         self.root.after(SERIAL_AUTOCONNECT_DELAY_MS, self.auto_connect_serial)
         self._tick()
 
@@ -651,8 +659,44 @@ class AirTrixxGUI:
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
+        power_panel = ttk.Frame(body)
+        power_panel.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        power_panel.columnconfigure(0, weight=1)
+        header_row = ttk.Frame(power_panel)
+        header_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        header_row.columnconfigure(0, weight=1)
+        ttk.Label(header_row, text="Device Status", style="Value.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header_row, text="Live power and connection state", style="Subtle.TLabel").grid(row=0, column=1, sticky="e")
+
+        battery_grid = ttk.Frame(power_panel)
+        battery_grid.grid(row=1, column=0, sticky="ew")
+        battery_specs = (
+            ("antenna", "Antenna"),
+            ("wristband", "Wristband"),
+            ("camdock", "Cam Dock"),
+            ("keyboard", "Keyboard"),
+            ("fans", "Fans"),
+            ("camera", "Camera"),
+            ("audiodock", "Audio Dock"),
+        )
+        columns = 4
+        for column in range(columns):
+            battery_grid.columnconfigure(column, weight=1)
+        for index, (device_key, title) in enumerate(battery_specs):
+            row_index = index // columns
+            column = index % columns
+            self._build_dashboard_battery_card(
+                battery_grid,
+                device_key,
+                title,
+                row=row_index,
+                column=column,
+                padx=(0, 6) if column < columns - 1 else (0, 0),
+                pady=(0, 6),
+            )
+
         fan_box = ttk.LabelFrame(body, text="Fans", padding=10)
-        fan_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+        fan_box.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
         fan_box.columnconfigure(0, weight=1)
         self.fan_status_var = tk.StringVar(value="Fans: waiting for controller.")
         self.fan_button = ttk.Button(fan_box, text="Turn Fans On", command=self.toggle_fans, style="Accent.TButton")
@@ -660,7 +704,7 @@ class AirTrixxGUI:
         ttk.Label(fan_box, textvariable=self.fan_status_var, wraplength=420).grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
         camera_box = ttk.LabelFrame(body, text="Camera", padding=10)
-        camera_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
+        camera_box.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
         camera_box.columnconfigure(0, weight=1)
         self.camera_centering_status_var = tk.StringVar(value="Camera centering: waiting for USB camera and Antenna link.")
         ttk.Label(camera_box, textvariable=self.camera_centering_status_var, wraplength=420).grid(row=0, column=0, sticky="ew")
@@ -668,14 +712,150 @@ class AirTrixxGUI:
             row=1, column=0, sticky="ew", pady=(8, 0)
         )
 
-        quick_box = ttk.LabelFrame(body, text="Quick Status", padding=10)
-        quick_box.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        quick_box.rowconfigure(0, weight=1)
-        quick_box.columnconfigure(0, weight=1)
-        self.dashboard_text = tk.Text(quick_box, height=12, wrap="word")
-        self.dashboard_text.grid(row=0, column=0, sticky="nsew")
-        self._style_text_widget(self.dashboard_text)
-        self._register_scroll_target(self.dashboard_text, self.dashboard_text)
+    def _build_dashboard_battery_card(
+        self,
+        parent: ttk.Frame,
+        device_key: str,
+        title: str,
+        *,
+        row: int,
+        column: int,
+        padx: tuple[int, int],
+        pady: tuple[int, int],
+    ) -> None:
+        card = tk.Frame(parent, bg="#ffffff", highlightbackground="#d8dee8", highlightthickness=1)
+        card.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
+        card.columnconfigure(0, weight=1)
+
+        header = tk.Frame(card, bg="#ffffff")
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(7, 0))
+        header.columnconfigure(0, weight=1)
+        tk.Label(
+            header,
+            text=title,
+            bg="#ffffff",
+            fg="#101828",
+            font=("Segoe UI Semibold", 10),
+        ).grid(row=0, column=0, sticky="w")
+        status_label = tk.Label(
+            header,
+            text="Wait",
+            bg="#f2f4f7",
+            fg="#475467",
+            font=("Segoe UI Semibold", 7),
+            padx=6,
+            pady=2,
+        )
+        status_label.grid(row=0, column=1, sticky="e")
+
+        detail_label = tk.Label(
+            card,
+            text="No battery data",
+            bg="#ffffff",
+            fg="#667085",
+            font=("Segoe UI", 8),
+        )
+        detail_label.grid(row=1, column=0, sticky="w", padx=8, pady=(1, 0))
+
+        percent_label = tk.Label(
+            card,
+            text="--",
+            bg="#ffffff",
+            fg="#101828",
+            font=("Segoe UI Semibold", 18),
+        )
+        percent_label.grid(row=2, column=0, sticky="w", padx=8, pady=(1, 0))
+
+        bar = tk.Canvas(card, height=6, bg="#ffffff", highlightthickness=0, bd=0)
+        bar.grid(row=3, column=0, sticky="ew", padx=8, pady=(1, 8))
+        card_state = {
+            "frame": card,
+            "status": status_label,
+            "percent": percent_label,
+            "detail": detail_label,
+            "bar": bar,
+            "level": None,
+            "color": "#98a2b3",
+        }
+        self.dashboard_battery_cards[device_key] = card_state
+        bar.bind("<Configure>", lambda _event, key=device_key: self._draw_dashboard_battery_bar(key))
+
+    @staticmethod
+    def _battery_level_number(value: Any) -> float | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, min(100.0, number))
+
+    @staticmethod
+    def _battery_status_style(level: float | None, status: str) -> tuple[str, str, str, str]:
+        normalized = status.strip().lower()
+        if level is None:
+            if normalized in {"ok", "connected", "ready", "live"}:
+                return "Online", "#f2f4f7", "#475467", "#98a2b3"
+            return "No data", "#f2f4f7", "#475467", "#98a2b3"
+        if level <= 15:
+            return "Critical", "#fef3f2", "#b42318", "#ef4444"
+        if level <= 35:
+            return "Low", "#fffaeb", "#b54708", "#f59e0b"
+        return "Healthy", "#ecfdf3", "#027a48", "#12b76a"
+
+    def _draw_dashboard_battery_bar(self, device_key: str) -> None:
+        card = self.dashboard_battery_cards.get(device_key)
+        if not card:
+            return
+        bar = card["bar"]
+        level = card.get("level")
+        color = str(card.get("color") or "#98a2b3")
+        width = max(1, bar.winfo_width())
+        height = max(1, bar.winfo_height())
+        bar.delete("all")
+        track_color = "#eef2f6"
+        fill_width = int(width * (float(level) / 100.0)) if isinstance(level, (int, float)) else 0
+        bar.create_rectangle(0, 0, width, height, fill=track_color, outline=track_color)
+        if fill_width > 0:
+            bar.create_rectangle(0, 0, fill_width, height, fill=color, outline=color)
+
+    def _dashboard_battery_device_state(self, device_key: str, devices: dict[str, Any]) -> dict[str, Any]:
+        if device_key == "antenna":
+            return {"status": "connected" if self.serial_bridge.is_connected else "disconnected"}
+        if device_key == "camera":
+            status = "live" if self.hand_tracker.has_latest_frame() else "no frame"
+            return {"status": status}
+        if device_key == "audiodock":
+            device = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
+            if not isinstance(device, dict):
+                device = {}
+            state = dict(device)
+            state.setdefault("status", self.audio_dock_bridge.status)
+            return state
+        device = devices.get(device_key, {}) if isinstance(devices, dict) else {}
+        return device if isinstance(device, dict) else {}
+
+    def _update_dashboard_battery_cards(self, devices: dict[str, Any]) -> None:
+        for device_key, card in self.dashboard_battery_cards.items():
+            device = self._dashboard_battery_device_state(device_key, devices)
+            level = self._battery_level_number(device.get("battery_level"))
+            voltage = device.get("battery_voltage")
+            status = str(device.get("status", "not_connected"))
+            label_text, label_bg, label_fg, color = self._battery_status_style(level, status)
+            percent_text = f"{level:.0f}%" if level is not None else "--"
+            voltage_text = f"{voltage} V" if voltage not in (None, "") else "Voltage unavailable"
+            if level is None and voltage in (None, ""):
+                detail_text = status.replace("_", " ")
+            elif level is None:
+                detail_text = voltage_text
+            else:
+                detail_text = f"{voltage_text} | {status}"
+            card["status"].configure(text=label_text, bg=label_bg, fg=label_fg)
+            card["percent"].configure(text=percent_text, fg=color if level is not None and level <= 35 else "#101828")
+            card["detail"].configure(text=detail_text)
+            card["level"] = level
+            card["color"] = color
+            self._draw_dashboard_battery_bar(device_key)
 
     def _build_camera_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Camera", "USB feed, face centering, mirroring, and pop-out view.")
@@ -1424,7 +1604,8 @@ class AirTrixxGUI:
         self.testing_live_values_var.set("Live values: " + ", ".join(parts))
 
     def _process_testing_snapshot(self, now_s: float) -> None:
-        self._update_testing_live_values()
+        if self.active_page == "Testing":
+            self._update_testing_live_values()
         if not self.testing_active:
             return
         self.testing_mapper.process(self._latest_snapshot, now_s)
@@ -2202,30 +2383,38 @@ class AirTrixxGUI:
     def _update_mapping_live_views(self) -> None:
         self._update_mapping_status()
         self._refresh_mapping_signal_tree()
-        self._refresh_mapping_table()
+        self._update_mapping_rule_status_cells()
 
     def _refresh_mapping_signal_tree(self) -> None:
         if not hasattr(self, "mapping_signal_tree"):
             return
-        for item_id in self.mapping_signal_tree.get_children():
-            self.mapping_signal_tree.delete(item_id)
-        self.mapping_signal_items.clear()
-        group_items: dict[str, str] = {}
         for signal in SignalCatalog.rows(self._latest_snapshot):
-            group_item = group_items.get(signal.group)
+            group_item = self.mapping_signal_group_items.get(signal.group)
             if group_item is None:
                 group_item = f"group:{signal.group.lower().replace(' ', '_')}"
-                group_items[signal.group] = group_item
-                self.mapping_signal_tree.insert("", "end", iid=group_item, text=signal.group, values=("", ""), open=True)
+                self.mapping_signal_group_items[signal.group] = group_item
+            if not self.mapping_signal_tree.exists(group_item):
+                self.mapping_signal_tree.insert(
+                    "",
+                    "end",
+                    iid=group_item,
+                    text=signal.group,
+                    values=("", ""),
+                    open=True,
+                )
             item_id = f"signal:{signal.id}"
             self.mapping_signal_items[signal.id] = item_id
-            self.mapping_signal_tree.insert(
-                group_item,
-                "end",
-                iid=item_id,
-                text=signal.label,
-                values=(signal.display_value, signal.id),
-            )
+            values = (signal.display_value, signal.id)
+            if self.mapping_signal_tree.exists(item_id):
+                self.mapping_signal_tree.item(item_id, text=signal.label, values=values)
+            else:
+                self.mapping_signal_tree.insert(
+                    group_item,
+                    "end",
+                    iid=item_id,
+                    text=signal.label,
+                    values=values,
+                )
 
     def _refresh_mapping_table(self) -> None:
         if not hasattr(self, "mapping_rule_tree"):
@@ -2251,6 +2440,22 @@ class AirTrixxGUI:
         for item_id in selected:
             if item_id in self.mapping_rule_tree.get_children():
                 self.mapping_rule_tree.selection_add(item_id)
+
+    def _update_mapping_rule_status_cells(self) -> None:
+        if not hasattr(self, "mapping_rule_tree"):
+            return
+        for rule in self.input_mapper.active_rules():
+            item_id = self.mapping_rule_items.get(rule.id)
+            if not item_id or not self.mapping_rule_tree.exists(item_id):
+                self._refresh_mapping_table()
+                return
+            state = self.input_mapper.state_for_rule(rule.id)
+            last = "-" if state.last_fired_s is None else f"{max(0.0, time.monotonic() - state.last_fired_s):.1f}s ago"
+            values = list(self.mapping_rule_tree.item(item_id, "values"))
+            if len(values) >= 7:
+                values[5] = state.status
+                values[6] = last
+                self.mapping_rule_tree.item(item_id, values=tuple(values))
 
     def _build_firmware_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Firmware", "Wireless firmware updates through the antenna bridge.")
@@ -2354,6 +2559,10 @@ class AirTrixxGUI:
         page.tkraise()
         for name, button in self.nav_buttons.items():
             button.configure(style="NavActive.TButton" if name == page_name else "Nav.TButton")
+        if page_name in {"Dashboard", "Signals", "Mappings", "Testing", "Data / Logs"}:
+            self._schedule_text_update(10)
+        if page_name == "Camera & Servo":
+            self._update_preview(force=True)
 
     def _register_scroll_target(self, widget: tk.Widget, target: tk.Widget) -> None:
         self._scroll_targets[str(widget)] = target
@@ -2379,6 +2588,7 @@ class AirTrixxGUI:
         return None
 
     def open_camera_popup(self) -> None:
+        self.camera_popup_dismissed = False
         self._ensure_camera_popup(lift=True)
 
     def _ensure_camera_popup(self, lift: bool = False) -> None:
@@ -2388,11 +2598,13 @@ class AirTrixxGUI:
                 self.camera_popup.deiconify()
                 self.camera_popup.lift()
             return
+        if self.camera_popup_dismissed and not lift:
+            return
         popup = tk.Toplevel(self.root)
         popup.title("AirTrixx Camera Feed")
         popup.geometry(self._camera_popup_geometry())
         popup.resizable(False, False)
-        popup.protocol("WM_DELETE_WINDOW", self._keep_camera_popup_visible)
+        popup.protocol("WM_DELETE_WINDOW", self.close_camera_popup)
         popup.configure(bg="#111827")
         popup.rowconfigure(0, weight=1)
         popup.columnconfigure(0, weight=1)
@@ -2407,8 +2619,9 @@ class AirTrixxGUI:
         self._set_camera_popup_placeholder()
         self._update_preview(force=True)
 
-    def _keep_camera_popup_visible(self) -> None:
-        self._ensure_camera_popup(lift=True)
+    def close_camera_popup(self) -> None:
+        self.camera_popup_dismissed = True
+        self._close_camera_popup()
 
     def _on_root_configure(self, event: tk.Event) -> None:
         if event.widget is self.root:
@@ -2458,6 +2671,7 @@ class AirTrixxGUI:
     def refresh_ports(self) -> None:
         ports = self.serial_bridge.available_ports()
         ports = sorted(ports, key=self._serial_port_sort_key)
+        self._serial_last_port_scan = ports
         values = [self._serial_port_label(p) for p in ports]
         self.port_combo["values"] = values
         if values and (
@@ -2472,26 +2686,131 @@ class AirTrixxGUI:
             self.port_var.set(preferred or values[0])
 
     def auto_connect_serial(self) -> None:
-        if self.serial_bridge.is_connected or not self.serial_autoconnect_enabled:
+        if (
+            self.serial_bridge.is_connected
+            or not self.serial_autoconnect_enabled
+            or self.serial_connect_in_progress
+        ):
             return
         self.refresh_ports()
-        selected = self.port_var.get().split(" - ", 1)[0].strip() or None
-        if selected and self.serial_bridge.connect(selected):
-            self.log(f"Auto-connected Antenna serial on {selected}.")
-            self._home_brackets_on_connect()
+        candidates = self._serial_connect_candidates(auto=True)
+        if candidates:
+            self._start_serial_connect(candidates, auto=True)
             return
         self.root.after(SERIAL_AUTOCONNECT_RETRY_MS, self.auto_connect_serial)
 
     def toggle_serial(self) -> None:
+        if self.serial_connect_in_progress:
+            self.log("Serial connection is already in progress.")
+            return
         if self.serial_bridge.is_connected:
             self.input_mapper.release_all()
             self.serial_autoconnect_enabled = False
+            self._serial_connect_generation += 1
             self.serial_bridge.disconnect()
             return
         self.serial_autoconnect_enabled = True
         selected = self.port_var.get().split(" - ", 1)[0].strip() or None
-        if self.serial_bridge.connect(selected):
+        if not self._serial_last_port_scan:
+            self.refresh_ports()
+        candidates = self._serial_connect_candidates(preferred=selected, auto=False)
+        if not candidates and selected:
+            candidates = [selected]
+        if not candidates:
+            self.log("No COM ports found.")
+            return
+        self._start_serial_connect(candidates, auto=False)
+
+    def _serial_connect_candidates(self, preferred: str | None = None, *, auto: bool) -> list[str]:
+        now = time.monotonic()
+        candidates: list[str] = []
+        ports_by_device = {p.get("device", ""): p for p in self._serial_last_port_scan}
+        preferred = preferred or (self.port_var.get().split(" - ", 1)[0].strip() or None)
+        if preferred and preferred in ports_by_device:
+            candidates.append(preferred)
+        for port in sorted(self._serial_last_port_scan, key=self._serial_port_sort_key):
+            device = port.get("device", "")
+            if not device or device in candidates:
+                continue
+            candidates.append(device)
+        if auto:
+            candidates = [
+                device
+                for device in candidates
+                if self._serial_failed_until.get(device, 0.0) <= now
+            ]
+        return candidates
+
+    def _start_serial_connect(self, candidates: list[str], *, auto: bool) -> None:
+        if self.serial_connect_in_progress:
+            return
+        self._serial_connect_generation += 1
+        generation = self._serial_connect_generation
+        self.serial_connect_in_progress = True
+        self.connect_button.configure(text="Connecting...", state="disabled")
+        label = "auto-connect" if auto else "connect"
+        self.log(f"Trying to {label} Antenna serial on {', '.join(candidates)}.")
+        worker = threading.Thread(
+            target=self._connect_serial_worker,
+            args=(candidates, generation, auto),
+            daemon=True,
+        )
+        worker.start()
+
+    def _connect_serial_worker(self, candidates: list[str], generation: int, auto: bool) -> None:
+        connected_port: str | None = None
+        failed_ports: list[str] = []
+        for candidate in candidates:
+            if generation != self._serial_connect_generation:
+                return
+            if self.serial_bridge.connect(candidate):
+                connected_port = candidate
+                break
+            failed_ports.append(candidate)
+        try:
+            self.root.after(
+                0,
+                lambda: self._finish_serial_connect(generation, connected_port, failed_ports, auto),
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_serial_connect(
+        self,
+        generation: int,
+        connected_port: str | None,
+        failed_ports: list[str],
+        auto: bool,
+    ) -> None:
+        if generation != self._serial_connect_generation:
+            if connected_port:
+                self.serial_bridge.disconnect()
+            return
+        self.serial_connect_in_progress = False
+        now = time.monotonic()
+        for port in failed_ports:
+            self._serial_failed_until[port] = now + SERIAL_PORT_FAIL_COOLDOWN_S
+        self.connect_button.configure(state="normal")
+        if connected_port and self.serial_bridge.is_connected:
+            self.config.serial_port = connected_port
+            label = self._serial_label_for_device(connected_port)
+            if label:
+                self.port_var.set(label)
+            self.log(f"{'Auto-c' if auto else 'C'}onnected Antenna serial on {connected_port}.")
             self._home_brackets_on_connect()
+            return
+        self.connect_button.configure(text="Connect")
+        if auto and self.serial_autoconnect_enabled and not self.serial_bridge.is_connected:
+            self.root.after(SERIAL_AUTOCONNECT_RETRY_MS, self.auto_connect_serial)
+
+    def _serial_label_for_device(self, device: str) -> str | None:
+        for port in self._serial_last_port_scan:
+            if port.get("device") == device:
+                return self._serial_port_label(port)
+        for label in self.port_combo["values"]:
+            if str(label).startswith(f"{device} - "):
+                return str(label)
+        return None
 
     def start_wristband_wireless_flash(self) -> None:
         if self.ota_in_progress:
@@ -2827,14 +3146,26 @@ class AirTrixxGUI:
 
     @staticmethod
     def _serial_port_sort_key(port: dict[str, str]) -> tuple[int, str]:
+        device = port.get("device", "")
+        device_number = AirTrixxGUI._serial_port_number(device)
         text = f'{port.get("description", "")} {port.get("hwid", "")}'.lower()
         if "vid:pid=303a" in text:
-            return (0, port.get("device", ""))
+            return (0, f"{device_number:04d}:{device}")
         if "usb" in text and "bluetooth" not in text:
-            return (1, port.get("device", ""))
+            return (1, f"{device_number:04d}:{device}")
         if "bluetooth" in text or "bthenum" in text:
-            return (9, port.get("device", ""))
-        return (5, port.get("device", ""))
+            return (9, f"{device_number:04d}:{device}")
+        return (5, f"{device_number:04d}:{device}")
+
+    @staticmethod
+    def _serial_port_number(device: str) -> int:
+        prefix = "COM"
+        upper = device.upper()
+        if upper.startswith(prefix):
+            suffix = upper[len(prefix):]
+            if suffix.isdigit():
+                return int(suffix)
+        return 9999
 
     def _preferred_serial_label(self, labels: list[str]) -> str | None:
         if self.config.serial_port:
@@ -3574,6 +3905,7 @@ class AirTrixxGUI:
             except tk.TclError:
                 pass
             self._mapping_refresh_after_id = None
+        self._serial_connect_generation += 1
         self.input_mapper.release_all()
         self._close_camera_popup()
         self._stop_ota_server()
@@ -3644,7 +3976,13 @@ class AirTrixxGUI:
             self._last_text_update_s = now_s
             self._update_text_views()
 
-        self.connect_button.configure(text="Disconnect" if self.serial_bridge.is_connected else "Connect")
+        if self.serial_connect_in_progress:
+            self.connect_button.configure(text="Connecting...", state="disabled")
+        else:
+            self.connect_button.configure(
+                text="Disconnect" if self.serial_bridge.is_connected else "Connect",
+                state="normal",
+            )
         self.record_button.configure(text="Recording..." if self.recorder.is_recording else "Record Gesture")
         self._update_gesture_recording_progress()
         self._update_fan_controls()
@@ -3937,24 +4275,45 @@ class AirTrixxGUI:
         return max(-CAMERA_CENTER_MAX_STEP_TICKS, min(CAMERA_CENTER_MAX_STEP_TICKS, step))
 
     def _update_preview(self, force: bool = False) -> None:
+        popup_visible = (
+            self.camera_popup is not None
+            and self.camera_popup.winfo_exists()
+            and self.camera_popup_label is not None
+        )
+        camera_page_visible = self.active_page == "Camera & Servo"
+        should_open_popup = (
+            not self.camera_popup_dismissed
+            and not popup_visible
+            and (self.camera_centering_active or self.hand_calibration_active)
+        )
+        if not force and not camera_page_visible and not popup_visible and not should_open_popup:
+            return
         now = time.monotonic()
         preview_fps = self._calibration_int("preview_fps", self.config.preview_fps, 1, 60)
         if not force and now - self._last_preview_update_s < 1.0 / float(preview_fps):
             return
         self._last_preview_update_s = now
-        self._ensure_camera_popup()
+        if should_open_popup:
+            self._ensure_camera_popup()
+            popup_visible = (
+                self.camera_popup is not None
+                and self.camera_popup.winfo_exists()
+                and self.camera_popup_label is not None
+            )
         frame = self.hand_tracker.get_latest_frame_rgb()
         if frame is None:
-            self._set_camera_popup_placeholder()
+            if popup_visible:
+                self._set_camera_popup_placeholder()
             return
         image = Image.fromarray(frame)
         self._draw_hand_calibration_overlay(image)
         self._draw_face_centering_guide(image)
         self._draw_camera_instruction_overlay(image)
-        preview_image = image.copy()
-        preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
-        self._photo = self._photo_image_from_pil(preview_image)
-        self.preview_label.configure(image=self._photo)
+        if camera_page_visible:
+            preview_image = image.copy()
+            preview_image.thumbnail((960, 540), Image.Resampling.LANCZOS)
+            self._photo = self._photo_image_from_pil(preview_image)
+            self.preview_label.configure(image=self._photo)
         if self.camera_popup is not None and self.camera_popup.winfo_exists() and self.camera_popup_label is not None:
             popup_image = image.copy()
             width = max(1, self.camera_popup.winfo_width())
@@ -4101,17 +4460,32 @@ class AirTrixxGUI:
         serial_state = self.serial_bridge.get_latest_state()
         input_dict = self._latest_snapshot.get("input_dict", {})
         input_array = self._latest_snapshot.get("input_array", [])
-        self._update_data_table(serial_state, input_dict)
-        self._update_dashboard_text(serial_state)
-        self._update_keyboard_grid(serial_state)
-        self._update_mapping_live_views()
-        self._set_text(self.json_text, json.dumps(serial_state, indent=2))
-        fused = {
-            "field_order": FIELD_ORDER,
-            "input_array": input_array,
-            "input_dict": input_dict,
-        }
-        self._set_text(self.fused_text, json.dumps(fused, indent=2))
+        page = self.active_page
+        if page == "Dashboard":
+            self._update_dashboard_text(serial_state)
+            return
+        if page == "Signals":
+            self._update_keyboard_grid(serial_state)
+            self._update_data_table(serial_state, input_dict)
+            return
+        if page == "Mappings":
+            self._update_mapping_live_views()
+            return
+        if page == "Testing":
+            self._update_testing_live_values()
+            return
+        if page == "Data / Logs":
+            self._update_data_table(serial_state, input_dict)
+            self._set_text(self.json_text, json.dumps(serial_state, indent=2))
+            fused = {
+                "field_order": FIELD_ORDER,
+                "input_array": input_array,
+                "input_dict": input_dict,
+            }
+            self._set_text(self.fused_text, json.dumps(fused, indent=2))
+            return
+        if page == "Camera & Servo":
+            return
 
     def _schedule_text_update(self, delay_ms: int = 50) -> None:
         if self._text_update_after_id is not None:
@@ -4128,28 +4502,7 @@ class AirTrixxGUI:
 
     def _update_dashboard_text(self, serial_state: dict[str, Any]) -> None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
-        wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
-        camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
-        keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
-        fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
-        lines = [
-            f"Antenna serial: {'connected' if self.serial_bridge.is_connected else 'disconnected'}",
-            f"Wristband: {wrist.get('status', 'not_connected') if isinstance(wrist, dict) else 'not_connected'}",
-            f"Cam Dock: {camdock.get('status', 'not_connected') if isinstance(camdock, dict) else 'not_connected'}",
-            f"Cam Dock battery: {camdock.get('battery_level', '-')}% / {camdock.get('battery_voltage', '-')}V"
-            if isinstance(camdock, dict)
-            else "Cam Dock battery: -",
-            f"Keyboard: {keyboard.get('status', 'not_connected') if isinstance(keyboard, dict) else 'not_connected'}",
-            f"Fans: {fans.get('status', 'not_connected') if isinstance(fans, dict) else 'not_connected'}",
-            f"Fan state: {'on' if fans.get('fan_on') else 'off'}" if isinstance(fans, dict) else "Fan state: -",
-            f"Fans battery: {fans.get('battery_level', '-')}% / {fans.get('battery_voltage', '-')}V"
-            if isinstance(fans, dict)
-            else "Fans battery: -",
-            self.camera_centering_status_var.get(),
-            self.hand_calibration_status_var.get(),
-        ]
-        if hasattr(self, "dashboard_text"):
-            self._set_text(self.dashboard_text, "\n".join(lines))
+        self._update_dashboard_battery_cards(devices if isinstance(devices, dict) else {})
 
     def _update_keyboard_grid(self, serial_state: dict[str, Any]) -> None:
         if not self.keyboard_cells:
@@ -4397,12 +4750,15 @@ class AirTrixxGUI:
         self.config.preview_fps = preview_fps
         self.config.face_detection_enabled_after_centering = face_after_centering
 
-        self.hand_tracker.configure(
-            width=width,
-            height=height,
-            tracking_frame_skip=tracking_frame_skip,
-            face_detection_enabled=face_detection_enabled,
-        )
+        settings = (width, height, tracking_frame_skip, face_detection_enabled)
+        if settings != self._last_runtime_perf_settings:
+            self.hand_tracker.configure(
+                width=width,
+                height=height,
+                tracking_frame_skip=tracking_frame_skip,
+                face_detection_enabled=face_detection_enabled,
+            )
+            self._last_runtime_perf_settings = settings
         self.servo_controller.camera_width = width
         self.servo_controller.camera_height = height
 

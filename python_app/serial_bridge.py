@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import queue
 import threading
 import time
 from typing import Any, Callable
@@ -36,6 +37,12 @@ class SerialBridge:
         self._manual_disconnect = False
         self._current_port: str | None = None
         self.audio_dock_bridge = None
+        self._write_queue: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=512)
+        self._coalesced_writes: dict[str, str] = {}
+        self._queued_coalesce_keys: set[str] = set()
+        self._coalesced_lock = threading.Lock()
+        self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer_thread.start()
 
     @staticmethod
     def available_ports() -> list[dict[str, str]]:
@@ -85,6 +92,7 @@ class SerialBridge:
         self._manual_disconnect = True
         self._stop_event.set()
         self._close_serial()
+        self._clear_write_queue()
         thread = self._reader_thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=0.5)
@@ -106,18 +114,71 @@ class SerialBridge:
         with self._latest_lock:
             return copy.deepcopy(self._latest_state)
 
-    def send_command(self, command: dict[str, Any]) -> bool:
+    def send_command(self, command: dict[str, Any], coalesce_key: str | None = None) -> bool:
         line = json.dumps(command, separators=(",", ":")) + "\n"
         with self._serial_lock:
             if not self._serial or not self._serial.is_open:
                 return False
+        try:
+            if coalesce_key:
+                should_enqueue = False
+                with self._coalesced_lock:
+                    self._coalesced_writes[coalesce_key] = line
+                    if coalesce_key not in self._queued_coalesce_keys:
+                        self._queued_coalesce_keys.add(coalesce_key)
+                        should_enqueue = True
+                if should_enqueue:
+                    self._write_queue.put_nowait(("coalesced", coalesce_key))
+            else:
+                self._write_queue.put_nowait(("line", line))
+            return True
+        except queue.Full:
+            if coalesce_key:
+                with self._coalesced_lock:
+                    self._queued_coalesce_keys.discard(coalesce_key)
+            self._log("Serial write queue is full; dropping command.")
+            return False
+
+    def _write_loop(self) -> None:
+        while True:
             try:
-                self._serial.write(line.encode("utf-8"))
-                return True
+                kind, payload = self._write_queue.get()
+            except Exception:
+                continue
+            line: str | None
+            if kind == "coalesced":
+                if payload is None:
+                    continue
+                with self._coalesced_lock:
+                    line = self._coalesced_writes.pop(payload, None)
+                    self._queued_coalesce_keys.discard(payload)
+                if line is None:
+                    continue
+            else:
+                line = payload
+            if line:
+                self._write_line(line)
+
+    def _write_line(self, line: str) -> None:
+        with self._serial_lock:
+            ser = self._serial
+            if not ser or not ser.is_open:
+                return
+            try:
+                ser.write(line.encode("utf-8"))
             except Exception as exc:
                 self._log(f"Serial write failed: {exc}")
                 self._close_serial()
-                return False
+
+    def _clear_write_queue(self) -> None:
+        with self._coalesced_lock:
+            self._coalesced_writes.clear()
+            self._queued_coalesce_keys.clear()
+        try:
+            while True:
+                self._write_queue.get_nowait()
+        except queue.Empty:
+            pass
 
     def _open_port(self, port: str) -> bool:
         try:

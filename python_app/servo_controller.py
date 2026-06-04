@@ -91,7 +91,7 @@ class ServoController:
             self._smoothed.clear()
             self._hand_history.clear()
 
-        sent = self._send(active_pair, servos, disable_unused=False)
+        sent = self._send(active_pair, servos, disable_unused=False, coalesce=True)
         debug["active_pair"] = active_pair
         debug["sent"] = sent
         debug["servos"] = {name: int(servos.get(name, 0)) for name in SERVO_FIELDS}
@@ -802,6 +802,7 @@ class ServoController:
         servos: dict[str, int],
         *,
         disable_unused: bool = True,
+        coalesce: bool = False,
     ) -> bool:
         servo_values = {name: int(servos.get(name, 0)) for name in SERVO_FIELDS}
         command: dict[str, Any] = {
@@ -812,6 +813,11 @@ class ServoController:
             "servos": servo_values,
         }
         command.update(servo_values)
+        if coalesce:
+            try:
+                return self.serial_bridge.send_command(command, coalesce_key="servo_auto")
+            except TypeError:
+                return self.serial_bridge.send_command(command)
         return self.serial_bridge.send_command(command)
 
     def _next_debug_sequence(self) -> int:

@@ -6,14 +6,14 @@ from config import load_app_config
 from fusion_state import FusionState
 from gui import AirTrixxGUI
 from mediapipe_tracker import HandTracker
-from runtime_acceleration import configure_runtime_acceleration
+from runtime_acceleration import request_windows_high_performance_gpu
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
 
 
 def main() -> None:
     config = load_app_config()
-    config.startup_warnings.extend(configure_runtime_acceleration())
+    config.startup_warnings.extend(request_windows_high_performance_gpu())
     serial_bridge = SerialBridge(baud_rate=config.serial_baud)
     hand_tracker = HandTracker(
         camera_index=config.camera_index,

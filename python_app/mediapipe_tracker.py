@@ -6,19 +6,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
-
 from app_paths import project_resource_path
 
-try:
-    import cv2
-except Exception:  # pragma: no cover
-    cv2 = None
-
-try:
-    import mediapipe as mp
-except Exception:  # pragma: no cover
-    mp = None
+cv2: Any | None = None
+mp: Any | None = None
+np: Any | None = None
+_dependency_lock = threading.Lock()
 
 
 LogCallback = Callable[[str], None]
@@ -59,6 +52,23 @@ HAND_CONNECTIONS = (
     (18, 19),
     (19, 20),
 )
+
+
+def _load_camera_dependencies() -> tuple[Any | None, Any | None, Any | None, str | None]:
+    global cv2, mp, np
+    with _dependency_lock:
+        if cv2 is not None and mp is not None and np is not None:
+            return cv2, mp, np, None
+        try:
+            import numpy as imported_np
+            import cv2 as imported_cv2
+            import mediapipe as imported_mp
+        except Exception as exc:  # pragma: no cover - handled at runtime
+            return None, None, None, str(exc)
+        np = imported_np
+        cv2 = imported_cv2
+        mp = imported_mp
+        return cv2, mp, np, None
 
 
 def _empty_hand_state() -> dict[str, dict[str, Any]]:
@@ -193,9 +203,6 @@ class HandTracker:
     def start(self) -> None:
         self._running_requested = True
         if self._thread and self._thread.is_alive():
-            return
-        if cv2 is None or mp is None:
-            self._log("OpenCV or MediaPipe is missing. Run pip install -r requirements.txt.")
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -432,6 +439,21 @@ class HandTracker:
         return False
 
     def _run(self) -> None:
+        cv2_module, mp_module, np_module, dependency_error = _load_camera_dependencies()
+        if dependency_error or cv2_module is None or mp_module is None or np_module is None:
+            self._log(
+                "OpenCV or MediaPipe is missing. Run pip install -r requirements.txt. "
+                f"Dependency error: {dependency_error or 'unknown'}"
+            )
+            return
+        try:
+            from runtime_acceleration import configure_opencv_acceleration
+
+            for message in configure_opencv_acceleration(cv2_module):
+                self._log(message)
+        except Exception:
+            pass
+
         requested_camera_index = self.camera_index
         mode = "legacy"
         legacy_error: Exception | None = None
