@@ -24,11 +24,13 @@ from app_paths import project_resource_path
 from config import AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
 from gesture_recorder import GestureRecorder
-from input_backend import PynputInputBackend, normalize_key_token, parse_key_combo
+from input_backend import FakeInputBackend, PynputInputBackend, normalize_key_token, parse_key_combo
 from input_mapper import (
     COMPARATORS,
     InputMapper,
     MappingAction,
+    MappingCondition,
+    MappingConfig,
     MappingProfile,
     MappingRule,
     SignalCatalog,
@@ -119,6 +121,11 @@ CALIBRATION_ENTRY_KEYS = [
     "tof_depth_alpha",
     "use_startup_user_distance",
     "startup_distance_live_weight",
+    "tracking_frame_skip",
+    "preview_fps",
+    "face_detection_enabled_after_centering",
+    "camera_width",
+    "camera_height",
     "prediction_latency_ms",
     "camera_horizontal_fov_deg",
     "camera_vertical_fov_deg",
@@ -236,6 +243,10 @@ class AirTrixxGUI:
         self.log_queue: queue.Queue[str] = queue.Queue()
         self._photo: tk.PhotoImage | None = None
         self._last_text_update_s = 0.0
+        self._text_update_after_id: str | None = None
+        self._mapping_refresh_after_id: str | None = None
+        self._last_preview_update_s = 0.0
+        self._last_tick_error = ""
         self._latest_snapshot: dict[str, Any] = {}
         self.centering_bracket: str | None = None
         self.centering_positions: dict[str, dict[str, int]] = {}
@@ -319,6 +330,20 @@ class AirTrixxGUI:
         self.mapping_start_enabled_var = tk.BooleanVar(value=mapping_config.enabled_on_start)
         self.mapping_profile_var = tk.StringVar(value=mapping_config.active_profile)
         self.mapping_status_var = tk.StringVar(value="Mapper: ready.")
+        self.testing_mode_var = tk.StringVar(value="selected")
+        self.testing_output_suppressed_var = tk.BooleanVar(value=True)
+        self.testing_status_var = tk.StringVar(value="Select a gesture to arm an individual test.")
+        self.testing_selected_var = tk.StringVar(value="Selected gesture: -")
+        self.testing_detected_var = tk.StringVar(value="Detected: -")
+        self.testing_live_values_var = tk.StringVar(value="Live values: -")
+        self.testing_backend = FakeInputBackend()
+        self.testing_mapper = InputMapper(self.testing_backend)
+        self.testing_entries: list[dict[str, Any]] = []
+        self.testing_entry_items: dict[str, str] = {}
+        self.testing_active = False
+        self.testing_selected_id = ""
+        self.testing_last_label = ""
+        self.testing_last_seen_s = 0.0
         if mapping_error:
             self.log(f"Input mappings reset because config could not be loaded: {mapping_error}")
         if self.input_backend.error:
@@ -334,6 +359,7 @@ class AirTrixxGUI:
 
         self._configure_styles()
         self._build_ui()
+        self._apply_runtime_performance_settings()
         self.refresh_ports()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after(500, self._ensure_camera_popup)
@@ -440,7 +466,18 @@ class AirTrixxGUI:
 
         nav_frame = ttk.Frame(sidebar, style="Sidebar.TFrame")
         nav_frame.grid(row=3, column=0, sticky="ew")
-        nav_items = ("Dashboard", "Signals", "Mappings", "Camera & Servo", "Audio Dock", "Firmware", "Settings", "Data / Logs")
+        nav_items = (
+            "Dashboard",
+            "Signals",
+            "Mappings",
+            "Testing",
+            "Camera & Servo",
+            "Gesture Recorder",
+            "Audio Dock",
+            "Firmware",
+            "Settings",
+            "Data / Logs",
+        )
         for row, name in enumerate(nav_items):
             button = ttk.Button(nav_frame, text=name, style="Nav.TButton", command=lambda page=name: self.show_page(page))
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
@@ -470,7 +507,9 @@ class AirTrixxGUI:
         self._build_dashboard_page(self.pages["Dashboard"])
         self._build_signals_page(self.pages["Signals"])
         self._build_mappings_page(self.pages["Mappings"])
+        self._build_testing_page(self.pages["Testing"])
         self._build_camera_servo_page(self.pages["Camera & Servo"])
+        self._build_gesture_recorder_page(self.pages["Gesture Recorder"])
         self._build_audio_dock_page(self.pages["Audio Dock"])
         self._build_firmware_page(self.pages["Firmware"])
         self._build_settings_page(self.pages["Settings"])
@@ -522,12 +561,12 @@ class AirTrixxGUI:
             builder(tab)
 
     def _build_camera_servo_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Camera & Servo", "Camera feed, centering, servo controls, and gesture capture.")
+        self._build_page_header(page, "Camera & Servo", "Camera feed, centering, and servo controls.")
         notebook = ttk.Notebook(page)
         notebook.grid(row=1, column=0, sticky="nsew")
         for title, builder in (
             ("Camera", self._build_camera_page),
-            ("Servo & Gestures", self._build_servo_page),
+            ("Servo", self._build_servo_page),
         ):
             tab = ttk.Frame(notebook)
             tab.rowconfigure(1, weight=1)
@@ -846,8 +885,8 @@ class AirTrixxGUI:
         ttk.Label(filter_bar, text="Search").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.live_data_search_entry = ttk.Entry(filter_bar, textvariable=self.live_data_search_var)
         self.live_data_search_entry.grid(row=0, column=3, sticky="ew")
-        self.live_data_device_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_text_views())
-        self.live_data_search_var.trace_add("write", lambda *_args: self._update_text_views())
+        self.live_data_device_combo.bind("<<ComboboxSelected>>", lambda _event: self._schedule_text_update())
+        self.live_data_search_var.trace_add("write", lambda *_args: self._schedule_text_update())
 
         self.data_tree = ttk.Treeview(data_box, columns=("device", "input"), show="headings", height=18)
         self.data_tree.grid(row=1, column=0, sticky="nsew")
@@ -859,7 +898,7 @@ class AirTrixxGUI:
         self._register_scroll_target(self.data_tree, self.data_tree)
 
     def _build_servo_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Servo Control", "Manual centering, neutral calibration, and gesture recording.")
+        self._build_page_header(page, "Servo Control", "Manual centering and neutral calibration.")
         body = self._scrollable_body(page)
         body.columnconfigure(0, weight=1)
         centering_box = ttk.LabelFrame(body, text="Servo Centering", padding=10)
@@ -909,24 +948,502 @@ class AirTrixxGUI:
         self.skip_calibration_button = ttk.Button(hand_calibration_box, text="Skip Calibration", command=self.skip_hand_calibration)
         self.skip_calibration_button.grid(row=1, column=1, sticky="ew", pady=(8, 0))
 
+    def _build_gesture_recorder_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Gesture Recorder", "Capture labeled gesture repetitions with a countdown and timer.")
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
         record_box = ttk.LabelFrame(body, text="Gesture Recorder", padding=10)
-        record_box.grid(row=2, column=0, sticky="ew")
+        record_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         record_box.columnconfigure(1, weight=1)
+        record_box.columnconfigure(3, weight=1)
         ttk.Label(record_box, text="Gesture name").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.gesture_name_var = tk.StringVar()
-        ttk.Entry(record_box, textvariable=self.gesture_name_var).grid(row=0, column=1, sticky="ew")
-        ttk.Label(record_box, text="Repetitions").grid(row=1, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
+        ttk.Entry(record_box, textvariable=self.gesture_name_var).grid(row=0, column=1, columnspan=3, sticky="ew")
+        ttk.Label(record_box, text="Repetitions").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
         self.repetitions_var = tk.StringVar(value="3")
-        ttk.Entry(record_box, textvariable=self.repetitions_var, width=10).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(record_box, text="Duration seconds").grid(row=2, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
+        ttk.Entry(record_box, textvariable=self.repetitions_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(record_box, text="Duration seconds").grid(row=1, column=2, sticky="w", pady=(8, 0), padx=(16, 8))
         self.duration_var = tk.StringVar(value="2.0")
-        ttk.Entry(record_box, textvariable=self.duration_var, width=10).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(record_box, textvariable=self.duration_var, width=10).grid(row=1, column=3, sticky="w", pady=(8, 0))
         self.record_button = ttk.Button(record_box, text="Record Gesture", command=self.record_gesture, style="Accent.TButton")
-        self.record_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.gesture_progress_text_var = tk.StringVar(value="0%")
-        self.gesture_progress_label = ttk.Label(record_box, textvariable=self.gesture_progress_text_var)
-        self.gesture_progress_bar = ttk.Progressbar(record_box, maximum=100, mode="determinate")
-        self._gesture_progress_visible = False
+        self.record_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+
+        status_box = ttk.LabelFrame(body, text="Recording Status", padding=10)
+        status_box.grid(row=1, column=0, sticky="ew")
+        status_box.columnconfigure(1, weight=1)
+        self.gesture_status_text_var = tk.StringVar(value="Ready to record.")
+        self.gesture_repetition_text_var = tk.StringVar(value="Repetition: -")
+        self.gesture_countdown_text_var = tk.StringVar(value="Countdown: -")
+        self.gesture_timer_text_var = tk.StringVar(value="Timer: -")
+        self.gesture_progress_text_var = tk.StringVar(value="Overall: 0%")
+        ttk.Label(status_box, text="Status").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(status_box, textvariable=self.gesture_status_text_var, style="Value.TLabel").grid(row=0, column=1, sticky="ew")
+        ttk.Label(status_box, textvariable=self.gesture_repetition_text_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(status_box, textvariable=self.gesture_countdown_text_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(status_box, textvariable=self.gesture_timer_text_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.gesture_progress_label = ttk.Label(status_box, textvariable=self.gesture_progress_text_var)
+        self.gesture_progress_label.grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+        self.gesture_progress_bar = ttk.Progressbar(status_box, maximum=100, mode="determinate")
+        self.gesture_progress_bar.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+
+    def _build_testing_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(page, "Testing", "Arm one gesture or watch every available gesture without sending PC input.")
+        page.rowconfigure(1, weight=1)
+        page.columnconfigure(0, weight=1)
+
+        body = ttk.Frame(page)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        controls = ttk.LabelFrame(body, text="Test Controls", padding=10)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(4, weight=1)
+        ttk.Radiobutton(
+            controls,
+            text="Selected gesture",
+            variable=self.testing_mode_var,
+            value="selected",
+            command=self.start_selected_testing,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            controls,
+            text="All in one",
+            variable=self.testing_mode_var,
+            value="all",
+            command=self.start_all_testing,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ttk.Checkbutton(
+            controls,
+            text="Suppress mapped outputs while testing",
+            variable=self.testing_output_suppressed_var,
+        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ttk.Button(controls, text="Start", command=self.start_testing, style="Accent.TButton").grid(
+            row=0, column=3, sticky="e", padx=(0, 6)
+        )
+        ttk.Button(controls, text="Stop", command=self.stop_testing, style="Secondary.TButton").grid(
+            row=0, column=4, sticky="w", padx=(0, 6)
+        )
+        ttk.Button(controls, text="Refresh List", command=self._refresh_testing_list, style="Secondary.TButton").grid(
+            row=0, column=5, sticky="e"
+        )
+
+        split = ttk.Panedwindow(body, orient="horizontal")
+        split.grid(row=1, column=0, sticky="nsew")
+
+        list_box = ttk.LabelFrame(split, text="Available Gestures", padding=10)
+        list_box.rowconfigure(0, weight=1)
+        list_box.columnconfigure(0, weight=1)
+        self.testing_tree = ttk.Treeview(
+            list_box,
+            columns=("type", "trigger", "status"),
+            show="tree headings",
+            selectmode="browse",
+        )
+        self.testing_tree.heading("#0", text="Gesture")
+        self.testing_tree.heading("type", text="Type")
+        self.testing_tree.heading("trigger", text="Trigger")
+        self.testing_tree.heading("status", text="Result")
+        self.testing_tree.column("#0", width=260, stretch=True)
+        self.testing_tree.column("type", width=110, stretch=False)
+        self.testing_tree.column("trigger", width=430, stretch=True)
+        self.testing_tree.column("status", width=130, stretch=False)
+        self.testing_tree.grid(row=0, column=0, sticky="nsew")
+        testing_scroll = ttk.Scrollbar(list_box, orient="vertical", command=self.testing_tree.yview)
+        testing_scroll.grid(row=0, column=1, sticky="ns")
+        self.testing_tree.configure(yscrollcommand=testing_scroll.set)
+        self.testing_tree.bind("<<TreeviewSelect>>", self._on_testing_selection_changed)
+        split.add(list_box, weight=3)
+
+        result_box = ttk.LabelFrame(split, text="Recognition Result", padding=10)
+        result_box.columnconfigure(1, weight=1)
+        ttk.Label(result_box, text="Mode").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(result_box, textvariable=self.testing_status_var, style="Value.TLabel", wraplength=380).grid(
+            row=0, column=1, sticky="ew"
+        )
+        ttk.Label(result_box, text="Selected").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+        ttk.Label(result_box, textvariable=self.testing_selected_var, wraplength=380).grid(
+            row=1, column=1, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(result_box, text="Detected").grid(row=2, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+        ttk.Label(result_box, textvariable=self.testing_detected_var, style="Value.TLabel", wraplength=380).grid(
+            row=2, column=1, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(result_box, text="Signals").grid(row=3, column=0, sticky="nw", pady=(8, 0), padx=(0, 8))
+        ttk.Label(result_box, textvariable=self.testing_live_values_var, wraplength=380).grid(
+            row=3, column=1, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(result_box, text="History").grid(row=4, column=0, sticky="nw", pady=(10, 0), padx=(0, 8))
+        self.testing_history_text = tk.Text(result_box, height=14, wrap="word")
+        self.testing_history_text.grid(row=4, column=1, sticky="nsew", pady=(10, 0))
+        result_box.rowconfigure(4, weight=1)
+        self._style_text_widget(self.testing_history_text, dark=True)
+        split.add(result_box, weight=2)
+
+        self._refresh_testing_list()
+
+    def _testing_raw_rule(
+        self,
+        entry_id: str,
+        name: str,
+        group: str,
+        source: str,
+        comparator: str,
+        threshold: Any = True,
+        *,
+        low: Any = 0.0,
+        high: Any = 1.0,
+        hysteresis: float = 0.0,
+        debounce_ms: int = 80,
+        conditions: list[MappingCondition] | None = None,
+    ) -> dict[str, Any]:
+        rule = MappingRule(
+            id=entry_id,
+            name=name,
+            enabled=True,
+            source=source,
+            comparator=comparator,
+            threshold=threshold,
+            low=low,
+            high=high,
+            hysteresis=hysteresis,
+            debounce_ms=debounce_ms,
+            conditions=conditions or [],
+            recognition_label=name,
+            action=MappingAction(type="keyboard_tap", keys=[]),
+        )
+        return {
+            "id": entry_id,
+            "name": name,
+            "type": group,
+            "trigger": f"{source} {rule.condition_summary()}",
+            "rule": rule,
+        }
+
+    def _testing_available_entries(self) -> list[dict[str, Any]]:
+        entries = [
+            self._testing_raw_rule("raw:right_open_palm", "Right hand open palm", "Camera", "hands.right.gesture", "eq", "open_palm"),
+            self._testing_raw_rule("raw:right_fist", "Right hand fist", "Camera", "hands.right.gesture", "eq", "closed_fist"),
+            self._testing_raw_rule("raw:left_open_palm", "Left hand open palm", "Camera", "hands.left.gesture", "eq", "open_palm"),
+            self._testing_raw_rule("raw:left_fist", "Left hand fist", "Camera", "hands.left.gesture", "eq", "closed_fist"),
+            self._testing_raw_rule(
+                "raw:both_open_palms",
+                "Both hands open palms",
+                "Camera",
+                "hands.left.gesture",
+                "eq",
+                "open_palm",
+                conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="open_palm")],
+            ),
+            self._testing_raw_rule(
+                "raw:both_fists",
+                "Both hands fists",
+                "Camera",
+                "hands.left.gesture",
+                "eq",
+                "closed_fist",
+                conditions=[MappingCondition(source="hands.right.gesture", comparator="eq", threshold="closed_fist")],
+            ),
+            self._testing_raw_rule(
+                "raw:wrist_roll_right",
+                "Wrist roll right",
+                "Wristband",
+                "fused.wrist_roll_right_detected",
+                "truthy",
+                True,
+                debounce_ms=120,
+            ),
+            self._testing_raw_rule(
+                "raw:wrist_roll_left",
+                "Wrist roll left",
+                "Wristband",
+                "fused.wrist_roll_left_detected",
+                "truthy",
+                True,
+                debounce_ms=120,
+            ),
+            self._testing_raw_rule(
+                "raw:wrist_roll_right_then_neutral",
+                "Wrist roll right then neutral",
+                "Wristband",
+                "fused.wrist_roll_right_then_neutral_detected",
+                "truthy",
+                True,
+                debounce_ms=120,
+            ),
+            self._testing_raw_rule(
+                "raw:wrist_pitch_up",
+                "Wrist pitch up",
+                "Wristband",
+                "fused.wrist_pitch_up_detected",
+                "truthy",
+                True,
+                debounce_ms=120,
+            ),
+            self._testing_raw_rule(
+                "raw:wrist_pitch_down",
+                "Wrist pitch down",
+                "Wristband",
+                "fused.wrist_pitch_down_detected",
+                "truthy",
+                True,
+                debounce_ms=120,
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_close",
+                "Right hand close to ToF",
+                "ToF",
+                "hands.right.z_mm",
+                "between",
+                low=30,
+                high=400,
+                hysteresis=8,
+                debounce_ms=80,
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_closer_50mm",
+                "Right hand getting closer by 5 cm",
+                "ToF movement",
+                "hands.right.z_mm",
+                "delta_decrease",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:right_hand_further_50mm",
+                "Right hand getting further by 5 cm",
+                "ToF movement",
+                "hands.right.z_mm",
+                "delta_increase",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_close",
+                "Left hand close to ToF",
+                "ToF",
+                "hands.left.z_mm",
+                "between",
+                low=30,
+                high=400,
+                hysteresis=8,
+                debounce_ms=80,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_closer_50mm",
+                "Left hand getting closer by 5 cm",
+                "ToF movement",
+                "hands.left.z_mm",
+                "delta_decrease",
+                50,
+                debounce_ms=0,
+            ),
+            self._testing_raw_rule(
+                "raw:left_hand_further_50mm",
+                "Left hand getting further by 5 cm",
+                "ToF movement",
+                "hands.left.z_mm",
+                "delta_increase",
+                50,
+                debounce_ms=0,
+            ),
+        ]
+
+        for rule in self.input_mapper.active_rules():
+            if not rule.enabled or not rule.source:
+                continue
+            test_rule = copy.deepcopy(rule)
+            test_rule.id = f"mapping:{rule.id}"
+            test_rule.recognition_label = rule.name
+            test_rule.action = MappingAction(type="keyboard_tap", keys=[])
+            entries.append(
+                {
+                    "id": test_rule.id,
+                    "name": rule.name,
+                    "type": "Mapping",
+                    "trigger": f"{rule.source} {rule.condition_summary()} -> {rule.action.summary()}",
+                    "rule": test_rule,
+                }
+            )
+        return entries
+
+    def _refresh_testing_list(self) -> None:
+        if not hasattr(self, "testing_tree"):
+            return
+        selected = self.testing_selected_id
+        self.testing_entries = self._testing_available_entries()
+        self.testing_entry_items.clear()
+        for item_id in self.testing_tree.get_children():
+            self.testing_tree.delete(item_id)
+        for entry in self.testing_entries:
+            item_id = entry["id"]
+            self.testing_entry_items[item_id] = item_id
+            self.testing_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                text=entry["name"],
+                values=(entry["type"], entry["trigger"], "-"),
+            )
+        if selected and selected in self.testing_entry_items:
+            self.testing_tree.selection_set(selected)
+            self.testing_tree.see(selected)
+        self._update_testing_live_values()
+
+    def _on_testing_selection_changed(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "testing_tree"):
+            return
+        selection = self.testing_tree.selection()
+        if not selection:
+            return
+        self.testing_selected_id = str(selection[0])
+        entry = self._testing_entry_by_id(self.testing_selected_id)
+        self.testing_mode_var.set("selected")
+        self.testing_selected_var.set(f"Selected gesture: {entry['name'] if entry else '-'}")
+        self.start_selected_testing()
+
+    def _testing_entry_by_id(self, entry_id: str) -> dict[str, Any] | None:
+        for entry in self.testing_entries:
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    def _testing_entries_for_mode(self) -> list[dict[str, Any]]:
+        if self.testing_mode_var.get() == "all":
+            return list(self.testing_entries)
+        entry = self._testing_entry_by_id(self.testing_selected_id)
+        return [entry] if entry is not None else []
+
+    def _reset_testing_mapper(self, entries: list[dict[str, Any]]) -> None:
+        rules = [copy.deepcopy(entry["rule"]) for entry in entries]
+        config = MappingConfig(
+            enabled_on_start=True,
+            active_profile="Testing",
+            profiles=[MappingProfile(name="Testing", mappings=rules)],
+        )
+        self.testing_backend = FakeInputBackend()
+        self.testing_mapper = InputMapper(self.testing_backend, config)
+        self.testing_mapper.set_enabled(True)
+        self.testing_last_label = ""
+        self.testing_last_seen_s = 0.0
+        for entry in self.testing_entries:
+            self._set_testing_entry_status(entry["id"], "-")
+
+    def start_testing(self) -> None:
+        if self.testing_mode_var.get() == "all":
+            self.start_all_testing()
+        else:
+            self.start_selected_testing()
+
+    def start_selected_testing(self) -> None:
+        if not self.testing_entries:
+            self._refresh_testing_list()
+        if not self.testing_selected_id and hasattr(self, "testing_tree"):
+            selection = self.testing_tree.selection()
+            self.testing_selected_id = str(selection[0]) if selection else ""
+        entries = self._testing_entries_for_mode()
+        if not entries:
+            self.testing_status_var.set("Select a gesture from the list first.")
+            return
+        self.testing_active = True
+        self.testing_mode_var.set("selected")
+        self._reset_testing_mapper(entries)
+        self.testing_selected_var.set(f"Selected gesture: {entries[0]['name']}")
+        self.testing_detected_var.set("Detected: waiting")
+        self.testing_status_var.set("Selected test armed.")
+        self._append_testing_history(f"Armed selected test: {entries[0]['name']}")
+
+    def start_all_testing(self) -> None:
+        if not self.testing_entries:
+            self._refresh_testing_list()
+        entries = list(self.testing_entries)
+        if not entries:
+            self.testing_status_var.set("No gestures are available to test.")
+            return
+        self.testing_active = True
+        self.testing_mode_var.set("all")
+        self._reset_testing_mapper(entries)
+        self.testing_selected_var.set("Selected gesture: all in one")
+        self.testing_detected_var.set("Detected: waiting")
+        self.testing_status_var.set("All-in-one test armed.")
+        self._append_testing_history("Armed all-in-one gesture test.")
+
+    def stop_testing(self) -> None:
+        self.testing_active = False
+        self.testing_mapper.release_all()
+        self.testing_status_var.set("Testing stopped.")
+        self.testing_detected_var.set("Detected: -")
+        self._append_testing_history("Stopped gesture testing.")
+
+    def _set_testing_entry_status(self, entry_id: str, status: str) -> None:
+        if not hasattr(self, "testing_tree") or entry_id not in self.testing_tree.get_children():
+            return
+        values = list(self.testing_tree.item(entry_id, "values"))
+        while len(values) < 3:
+            values.append("")
+        values[2] = status
+        self.testing_tree.item(entry_id, values=tuple(values))
+
+    def _append_testing_history(self, message: str) -> None:
+        if not hasattr(self, "testing_history_text"):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.testing_history_text.insert("end", f"[{timestamp}] {message}\n")
+        self.testing_history_text.see("end")
+
+    def _update_testing_live_values(self) -> None:
+        if not hasattr(self, "testing_live_values_var"):
+            return
+        signals = SignalCatalog.flatten(self._latest_snapshot)
+
+        def value(signal_id: str) -> str:
+            signal = signals.get(signal_id)
+            return signal.display_value if signal else "-"
+
+        parts = [
+            f"L gesture {value('hands.left.gesture')}",
+            f"R gesture {value('hands.right.gesture')}",
+            f"L z {value('hands.left.z_mm')} mm",
+            f"R z {value('hands.right.z_mm')} mm",
+            f"pitch {value('fused.wrist_pitch')}",
+            f"roll {value('fused.wrist_roll')}",
+            f"pitch d {value('fused.wrist_pitch_delta')}",
+            f"roll d {value('fused.wrist_roll_delta')}",
+            f"pitch v {value('fused.wrist_pitch_velocity_dps')}",
+            f"roll v {value('fused.wrist_roll_velocity_dps')}",
+            f"roll profile {value('fused.wrist_roll_velocity_profile')}",
+            f"roll guard {value('fused.wrist_roll_candidate_active')}",
+            f"roll cooldown {value('fused.wrist_roll_event_cooldown_active')}",
+            f"roll blocked {value('fused.wrist_roll_event_blocked')}",
+            f"pitch up {value('fused.wrist_pitch_up_detected')}",
+            f"pitch down {value('fused.wrist_pitch_down_detected')}",
+            f"dominant {value('fused.wrist_dominant_axis')}",
+            f"motion {value('fused.wrist_motion')}",
+        ]
+        self.testing_live_values_var.set("Live values: " + ", ".join(parts))
+
+    def _process_testing_snapshot(self, now_s: float) -> None:
+        self._update_testing_live_values()
+        if not self.testing_active:
+            return
+        self.testing_mapper.process(self._latest_snapshot, now_s)
+        label = self.testing_mapper.last_recognition(max_age_s=0.25, now_s=now_s)
+        if not label:
+            return
+        if label == self.testing_last_label and now_s - self.testing_last_seen_s < 0.25:
+            return
+        self.testing_last_label = label
+        self.testing_last_seen_s = now_s
+        self.testing_detected_var.set(f"Detected: {label}")
+        self.testing_status_var.set("PASS: gesture recognised.")
+        for entry in self.testing_entries:
+            if entry["name"] == label:
+                self._set_testing_entry_status(entry["id"], "PASS")
+                if hasattr(self, "testing_tree"):
+                    self.testing_tree.see(entry["id"])
+                break
+        self._append_testing_history(f"Recognised: {label}")
 
     def _build_audio_dock_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Audio Dock", "Clap-triggered audio through the Antenna bridge and Deepgram transcription.")
@@ -1070,9 +1587,19 @@ class AirTrixxGUI:
 
     def on_mapping_profile_changed(self, _event: tk.Event | None = None) -> None:
         if self.input_mapper.set_active_profile(self.mapping_profile_var.get()):
-            self._refresh_mapping_table()
+            self._schedule_mapping_views_refresh()
             self._update_mapping_status()
             self.log(f"Input mapping profile switched to {self.input_mapper.config.active_profile}.")
+
+    def _schedule_mapping_views_refresh(self) -> None:
+        if self._mapping_refresh_after_id is not None:
+            return
+        self._mapping_refresh_after_id = self.root.after_idle(self._run_scheduled_mapping_views_refresh)
+
+    def _run_scheduled_mapping_views_refresh(self) -> None:
+        self._mapping_refresh_after_id = None
+        self._refresh_mapping_table()
+        self._refresh_testing_list()
 
     def new_mapping_profile(self) -> None:
         existing = set(self.input_mapper.config.profile_names())
@@ -1087,6 +1614,7 @@ class AirTrixxGUI:
         self.mapping_profile_var.set(name)
         self._refresh_mapping_profile_combo()
         self._refresh_mapping_table()
+        self._refresh_testing_list()
         self._update_mapping_status()
 
     def save_input_mappings(self) -> None:
@@ -1104,6 +1632,7 @@ class AirTrixxGUI:
         self.mapping_profile_var.set(config.active_profile)
         self._refresh_mapping_profile_combo()
         self._refresh_mapping_table()
+        self._refresh_testing_list()
         self._update_mapping_status()
         self.log(f"Loaded input mappings from {self.mapping_config_path}.")
 
@@ -1125,6 +1654,7 @@ class AirTrixxGUI:
         self.mapping_profile_var.set(config.active_profile)
         self._refresh_mapping_profile_combo()
         self._refresh_mapping_table()
+        self._refresh_testing_list()
         self._update_mapping_status()
         self.log(f"Imported input mappings from {selected}.")
 
@@ -1199,6 +1729,7 @@ class AirTrixxGUI:
         self.input_mapper.release_all()
         self.input_mapper.config.active().mappings.append(duplicate)
         self._refresh_mapping_table()
+        self._refresh_testing_list()
         self._update_mapping_status()
 
     def delete_selected_input_mapping(self) -> None:
@@ -1210,6 +1741,7 @@ class AirTrixxGUI:
         profile = self.input_mapper.config.active()
         profile.mappings = [item for item in profile.mappings if item.id != rule.id]
         self._refresh_mapping_table()
+        self._refresh_testing_list()
         self._update_mapping_status()
 
     def test_selected_input_mapping(self) -> None:
@@ -1225,13 +1757,18 @@ class AirTrixxGUI:
         sources.update(item.source for item in self.input_mapper.active_rules() if item.source)
         if rule.source:
             sources.add(rule.source)
+        sources.update(condition.source for condition in rule.all_conditions() if condition.source)
+        if rule.action.absolute_x_source:
+            sources.add(rule.action.absolute_x_source)
+        if rule.action.absolute_y_source:
+            sources.add(rule.action.absolute_y_source)
         return sorted(sources)
 
     def _open_mapping_dialog(self, rule: MappingRule, *, is_new: bool) -> None:
         working = copy.deepcopy(rule)
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Mapping" if is_new else "Edit Mapping")
-        dialog.geometry("760x610")
+        dialog.geometry("980x780")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(0, weight=1)
@@ -1262,8 +1799,43 @@ class AirTrixxGUI:
         speed_y_var = tk.StringVar(value=str(working.action.speed_y))
         absolute_x_var = tk.StringVar(value=str(working.action.absolute_x))
         absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
+        absolute_x_source_var = tk.StringVar(value=working.action.absolute_x_source)
+        absolute_y_source_var = tk.StringVar(value=working.action.absolute_y_source)
         continuous_var = tk.BooleanVar(value=working.action.continuous)
         status_var = tk.StringVar(value="")
+        source_options = self._rule_dialog_sources(working)
+
+        modifier_comparators = tuple(
+            comparator for comparator in MAPPING_COMPARATOR_OPTIONS if comparator not in {"delta_decrease", "delta_increase"}
+        )
+        starting_conditions = [condition for condition in working.all_conditions() if condition.source][:2]
+        modifier_enabled_vars = [tk.BooleanVar(value=index < len(starting_conditions)) for index in range(2)]
+        modifier_source_vars = [
+            tk.StringVar(value=starting_conditions[index].source if index < len(starting_conditions) else "")
+            for index in range(2)
+        ]
+        modifier_comparator_vars = [
+            tk.StringVar(value=starting_conditions[index].comparator if index < len(starting_conditions) else "eq")
+            for index in range(2)
+        ]
+        modifier_threshold_vars = [
+            tk.StringVar(value=str(starting_conditions[index].threshold) if index < len(starting_conditions) else "")
+            for index in range(2)
+        ]
+        modifier_low_vars = [
+            tk.StringVar(value=str(starting_conditions[index].low) if index < len(starting_conditions) else "0.0")
+            for index in range(2)
+        ]
+        modifier_high_vars = [
+            tk.StringVar(value=str(starting_conditions[index].high) if index < len(starting_conditions) else "1.0")
+            for index in range(2)
+        ]
+        modifier_output_keys_vars = [
+            tk.StringVar(
+                value=", ".join(starting_conditions[index].output_keys) if index < len(starting_conditions) else ""
+            )
+            for index in range(2)
+        ]
 
         def add_label(row: int, text: str, col: int = 0) -> None:
             ttk.Label(frame, text=text).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=4)
@@ -1275,9 +1847,62 @@ class AirTrixxGUI:
         ttk.Checkbutton(frame, text="Enabled", variable=enabled_var).grid(row=row, column=1, sticky="w", pady=4)
         row += 1
         add_label(row, "Source")
-        source_combo = ttk.Combobox(frame, textvariable=source_var, values=self._rule_dialog_sources(working))
+        source_combo = ttk.Combobox(frame, textvariable=source_var, values=source_options)
         source_combo.grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
         row += 1
+        modifier_frames: list[ttk.Frame] = []
+        modifier_rows: list[int] = []
+        for modifier_index in range(2):
+            modifier_number = modifier_index + 1
+            modifier_rows.append(row)
+            ttk.Checkbutton(
+                frame,
+                text=f"Modifier {modifier_number}",
+                variable=modifier_enabled_vars[modifier_index],
+            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            modifier_frame = ttk.Frame(frame)
+            modifier_frame.columnconfigure(0, weight=2)
+            modifier_frame.columnconfigure(1, weight=0)
+            modifier_frame.columnconfigure(2, weight=1)
+            modifier_frame.columnconfigure(3, weight=1)
+            modifier_frame.columnconfigure(4, weight=1)
+            modifier_frame.columnconfigure(5, weight=1)
+            for column_index, label in enumerate(("Source", "Comparator", "Threshold", "Low", "High", "Hold keys")):
+                ttk.Label(modifier_frame, text=label).grid(row=0, column=column_index, sticky="w", padx=(0, 6))
+            ttk.Combobox(
+                modifier_frame,
+                textvariable=modifier_source_vars[modifier_index],
+                values=source_options,
+            ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
+            ttk.Combobox(
+                modifier_frame,
+                textvariable=modifier_comparator_vars[modifier_index],
+                values=modifier_comparators,
+                state="readonly",
+                width=11,
+            ).grid(row=1, column=1, sticky="w", padx=(0, 6))
+            ttk.Entry(
+                modifier_frame,
+                textvariable=modifier_threshold_vars[modifier_index],
+                width=14,
+            ).grid(row=1, column=2, sticky="ew", padx=(0, 6))
+            ttk.Entry(
+                modifier_frame,
+                textvariable=modifier_low_vars[modifier_index],
+                width=10,
+            ).grid(row=1, column=3, sticky="ew", padx=(0, 6))
+            ttk.Entry(
+                modifier_frame,
+                textvariable=modifier_high_vars[modifier_index],
+                width=10,
+            ).grid(row=1, column=4, sticky="ew", padx=(0, 6))
+            ttk.Entry(
+                modifier_frame,
+                textvariable=modifier_output_keys_vars[modifier_index],
+                width=12,
+            ).grid(row=1, column=5, sticky="ew")
+            modifier_frames.append(modifier_frame)
+            row += 1
         add_label(row, "Comparator")
         ttk.Combobox(
             frame,
@@ -1341,6 +1966,15 @@ class AirTrixxGUI:
         add_label(row, "Absolute Y", 2)
         ttk.Entry(frame, textvariable=absolute_y_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
         row += 1
+        add_label(row, "Absolute X source")
+        ttk.Combobox(frame, textvariable=absolute_x_source_var, values=source_options).grid(
+            row=row, column=1, sticky="ew", pady=4
+        )
+        add_label(row, "Absolute Y source", 2)
+        ttk.Combobox(frame, textvariable=absolute_y_source_var, values=source_options).grid(
+            row=row, column=3, sticky="ew", pady=4
+        )
+        row += 1
         ttk.Checkbutton(frame, text="Continuous absolute move", variable=continuous_var).grid(
             row=row, column=1, columnspan=3, sticky="w", pady=4
         )
@@ -1349,6 +1983,23 @@ class AirTrixxGUI:
             row=row, column=0, columnspan=4, sticky="ew", pady=(8, 4)
         )
         row += 1
+
+        def refresh_modifier_rows() -> None:
+            for modifier_index, modifier_frame in enumerate(modifier_frames):
+                if modifier_enabled_vars[modifier_index].get():
+                    modifier_frame.grid(
+                        row=modifier_rows[modifier_index],
+                        column=1,
+                        columnspan=3,
+                        sticky="ew",
+                        pady=4,
+                    )
+                else:
+                    modifier_frame.grid_remove()
+
+        for modifier_index in range(2):
+            modifier_enabled_vars[modifier_index].trace_add("write", lambda *_args: refresh_modifier_rows())
+        refresh_modifier_rows()
 
         recorded_tokens: list[str] = []
         binding_id: str | None = None
@@ -1434,9 +2085,58 @@ class AirTrixxGUI:
                     "speed_y": speed_y_var.get(),
                     "absolute_x": absolute_x_var.get(),
                     "absolute_y": absolute_y_var.get(),
+                    "absolute_x_source": absolute_x_source_var.get().strip(),
+                    "absolute_y_source": absolute_y_source_var.get().strip(),
                     "continuous": continuous_var.get(),
                 }
             )
+
+        def parse_conditions() -> list[MappingCondition]:
+            conditions: list[MappingCondition] = []
+            for modifier_index in range(2):
+                if not modifier_enabled_vars[modifier_index].get():
+                    continue
+                modifier_number = modifier_index + 1
+                source = modifier_source_vars[modifier_index].get().strip()
+                comparator = modifier_comparator_vars[modifier_index].get()
+                threshold = modifier_threshold_vars[modifier_index].get().strip()
+                low = modifier_low_vars[modifier_index].get().strip()
+                high = modifier_high_vars[modifier_index].get().strip()
+                output_keys = parse_key_combo(modifier_output_keys_vars[modifier_index].get())
+                if not source:
+                    raise ValueError(f"modifier {modifier_number} needs a source")
+                if comparator in {"present", "truthy", "falsey"}:
+                    conditions.append(
+                        MappingCondition.from_dict(
+                            {"source": source, "comparator": comparator, "output_keys": output_keys}
+                        )
+                    )
+                elif comparator in {"between", "outside"}:
+                    conditions.append(
+                        MappingCondition.from_dict(
+                            {
+                                "source": source,
+                                "comparator": comparator,
+                                "low": low,
+                                "high": high,
+                                "output_keys": output_keys,
+                            }
+                        )
+                    )
+                else:
+                    if not threshold:
+                        raise ValueError(f"modifier {modifier_number} needs a threshold")
+                    conditions.append(
+                        MappingCondition.from_dict(
+                            {
+                                "source": source,
+                                "comparator": comparator,
+                                "threshold": threshold,
+                                "output_keys": output_keys,
+                            }
+                        )
+                    )
+            return conditions
 
         def build_rule() -> MappingRule | None:
             try:
@@ -1451,6 +2151,7 @@ class AirTrixxGUI:
                     high=high_var.get().strip(),
                     hysteresis=float(hysteresis_var.get() or 0.0),
                     debounce_ms=int(float(debounce_var.get() or 0)),
+                    conditions=parse_conditions(),
                     action=build_action(),
                 )
             except Exception as exc:
@@ -1480,6 +2181,7 @@ class AirTrixxGUI:
                         profile.mappings[index] = new_rule
                         break
             self._refresh_mapping_table()
+            self._refresh_testing_list()
             self._update_mapping_status()
             stop_recording()
             dialog.destroy()
@@ -1703,7 +2405,7 @@ class AirTrixxGUI:
         self.camera_popup_label = ttk.Label(popup, background="#111827")
         self.camera_popup_label.grid(row=0, column=0, sticky="nsew")
         self._set_camera_popup_placeholder()
-        self._update_preview()
+        self._update_preview(force=True)
 
     def _keep_camera_popup_visible(self) -> None:
         self._ensure_camera_popup(lift=True)
@@ -2146,6 +2848,7 @@ class AirTrixxGUI:
         camera_index = CAMERA_SOURCE_INDICES.get(source, self.config.camera_index)
         self.config.camera_index = camera_index
         self.hand_tracker.configure(camera_index=camera_index)
+        self._apply_runtime_performance_settings()
         self.log(f"Camera source set to {source} (index {camera_index}).")
 
     def toggle_camera_mirror(self) -> None:
@@ -2576,6 +3279,7 @@ class AirTrixxGUI:
         self.config.calibration = calibration
         self._sync_calibration_entries(calibration)
         self.servo_controller.update_calibration(calibration)
+        self._apply_runtime_performance_settings()
         self.centering_positions.clear()
         self.log(f"Loaded calibration from {self.config.calibration_path}")
 
@@ -2822,27 +3526,54 @@ class AirTrixxGUI:
         except ValueError:
             self.log("Repetitions and duration must be numbers.")
             return
-        self.recorder.start(self.gesture_name_var.get(), repetitions, duration_s)
+        self.recorder.start(self.gesture_name_var.get(), repetitions, duration_s, countdown_s=3)
 
     def _update_gesture_recording_progress(self) -> None:
-        if self.recorder.is_recording:
-            pct = int(round(self.recorder.progress * 100))
-            self.gesture_progress_bar["value"] = pct
-            self.gesture_progress_text_var.set(f"{pct}%")
-            if not self._gesture_progress_visible:
-                self.gesture_progress_label.grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-                self.gesture_progress_bar.grid(row=4, column=1, sticky="ew", pady=(8, 0))
-                self._gesture_progress_visible = True
+        state = self.recorder.state
+        pct = int(round(state.progress * 100))
+        self.gesture_progress_bar["value"] = pct
+        self.gesture_progress_text_var.set(f"Overall: {pct}%")
+
+        if state.repetitions > 0:
+            rep_text = f"Repetition: {state.repetition_index}/{state.repetitions}"
+        else:
+            rep_text = "Repetition: -"
+        self.gesture_repetition_text_var.set(rep_text)
+
+        duration_s = max(0.0, state.duration_s)
+        elapsed_s = min(duration_s, max(0.0, state.recording_elapsed_s))
+        self.gesture_timer_text_var.set(f"Timer: {elapsed_s:.1f}s / {duration_s:.1f}s")
+
+        if state.phase in {"starting", "countdown"}:
+            remaining_s = max(0, int(state.countdown_remaining_s + 0.999))
+            self.gesture_status_text_var.set(f"{state.gesture_name}: get ready.")
+            self.gesture_countdown_text_var.set(f"Countdown: {remaining_s}s")
             return
 
-        if self._gesture_progress_visible:
-            self.gesture_progress_label.grid_remove()
-            self.gesture_progress_bar.grid_remove()
-            self.gesture_progress_bar["value"] = 0
-            self.gesture_progress_text_var.set("0%")
-            self._gesture_progress_visible = False
+        self.gesture_countdown_text_var.set("Countdown: -")
+        if state.phase == "recording":
+            self.gesture_status_text_var.set(f"Recording {state.gesture_name}.")
+        elif state.phase == "saving":
+            self.gesture_status_text_var.set(f"Saving {state.gesture_name}.")
+        elif state.phase == "finished":
+            self.gesture_status_text_var.set("Gesture recording finished.")
+        else:
+            self.gesture_status_text_var.set("Ready to record.")
+            self.gesture_timer_text_var.set("Timer: -")
 
     def close(self) -> None:
+        if self._text_update_after_id is not None:
+            try:
+                self.root.after_cancel(self._text_update_after_id)
+            except tk.TclError:
+                pass
+            self._text_update_after_id = None
+        if self._mapping_refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self._mapping_refresh_after_id)
+            except tk.TclError:
+                pass
+            self._mapping_refresh_after_id = None
         self.input_mapper.release_all()
         self._close_camera_popup()
         self._stop_ota_server()
@@ -2853,7 +3584,23 @@ class AirTrixxGUI:
         self.root.destroy()
 
     def _tick(self) -> None:
+        try:
+            self._tick_body()
+            self._last_tick_error = ""
+        except Exception as exc:
+            message = f"Runtime update recovered after error: {type(exc).__name__}: {exc}"
+            if message != self._last_tick_error:
+                self._last_tick_error = message
+                self.log(message)
+        finally:
+            try:
+                self.root.after(33, self._tick)
+            except tk.TclError:
+                pass
+
+    def _tick_body(self) -> None:
         self._drain_log_queue()
+        self._apply_runtime_performance_settings()
 
         hands = self.hand_tracker.get_latest_hands()
         serial_state = self.serial_bridge.get_latest_state()
@@ -2869,15 +3616,32 @@ class AirTrixxGUI:
         if isinstance(input_dict, dict):
             input_dict["audiodock_input"] = self.audio_dock_bridge.latest_transcript or "TBD"
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
-        mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut
-        if self.serial_bridge.is_connected:
-            self.input_mapper.process(self._latest_snapshot, time.monotonic(), suppress_output=mapper_suppressed)
-        else:
+        now_s = time.monotonic()
+        testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
+        mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
+        try:
+            if self.serial_bridge.is_connected:
+                self.input_mapper.process(self._latest_snapshot, now_s, suppress_output=mapper_suppressed)
+            else:
+                self.input_mapper.release_all()
+        except Exception as exc:
             self.input_mapper.release_all()
+            message = f"Input mapper recovered after error: {type(exc).__name__}: {exc}"
+            if message != self._last_tick_error:
+                self._last_tick_error = message
+                self.log(message)
+        try:
+            self._process_testing_snapshot(now_s)
+        except Exception as exc:
+            self.testing_active = False
+            message = f"Gesture testing recovered after error: {type(exc).__name__}: {exc}"
+            if message != self._last_tick_error:
+                self._last_tick_error = message
+                self.log(message)
         self._update_servo_debug_console()
         self._update_preview()
-        if time.monotonic() - self._last_text_update_s >= 0.2:
-            self._last_text_update_s = time.monotonic()
+        if self._text_update_after_id is None and now_s - self._last_text_update_s >= 0.2:
+            self._last_text_update_s = now_s
             self._update_text_views()
 
         self.connect_button.configure(text="Disconnect" if self.serial_bridge.is_connected else "Connect")
@@ -2885,7 +3649,6 @@ class AirTrixxGUI:
         self._update_gesture_recording_progress()
         self._update_fan_controls()
         self._update_status_strip()
-        self.root.after(33, self._tick)
 
     def _update_status_strip(self) -> None:
         if self.serial_bridge.is_connected:
@@ -2897,8 +3660,11 @@ class AirTrixxGUI:
         if self.input_mapper.has_held_outputs:
             mapper_state += ", holding"
         self.mapper_chip_var.set(f"Mapper: {mapper_state}")
-        frame = self.hand_tracker.get_latest_frame_rgb()
-        self.camera_chip_var.set("Camera: live" if frame is not None else "Camera: no frame")
+        frame_state = "live" if self.hand_tracker.has_latest_frame() else "no frame"
+        self.camera_chip_var.set(
+            f"Camera: {frame_state} {self.config.camera_width}x{self.config.camera_height}, "
+            f"preview {self.config.preview_fps} FPS"
+        )
         self.permissions_status_var.set(f"App data: {self.config.user_data_dir}")
 
     def _home_brackets_on_connect(self) -> None:
@@ -3170,7 +3936,12 @@ class AirTrixxGUI:
             step = 1 if value > 0 else -1
         return max(-CAMERA_CENTER_MAX_STEP_TICKS, min(CAMERA_CENTER_MAX_STEP_TICKS, step))
 
-    def _update_preview(self) -> None:
+    def _update_preview(self, force: bool = False) -> None:
+        now = time.monotonic()
+        preview_fps = self._calibration_int("preview_fps", self.config.preview_fps, 1, 60)
+        if not force and now - self._last_preview_update_s < 1.0 / float(preview_fps):
+            return
+        self._last_preview_update_s = now
         self._ensure_camera_popup()
         frame = self.hand_tracker.get_latest_frame_rgb()
         if frame is None:
@@ -3278,6 +4049,9 @@ class AirTrixxGUI:
 
         camera_status = self.camera_centering_status_var.get()
         calibration_status = self.hand_calibration_status_var.get()
+        recognition_status = self.input_mapper.last_recognition()
+        if recognition_status:
+            add(recognition_status)
         if self.camera_centering_active:
             add(camera_status)
         if self.hand_calibration_active or self.startup_hand_calibration_pending:
@@ -3338,6 +4112,19 @@ class AirTrixxGUI:
             "input_dict": input_dict,
         }
         self._set_text(self.fused_text, json.dumps(fused, indent=2))
+
+    def _schedule_text_update(self, delay_ms: int = 50) -> None:
+        if self._text_update_after_id is not None:
+            try:
+                self.root.after_cancel(self._text_update_after_id)
+            except tk.TclError:
+                pass
+        self._text_update_after_id = self.root.after(delay_ms, self._run_scheduled_text_update)
+
+    def _run_scheduled_text_update(self) -> None:
+        self._text_update_after_id = None
+        self._last_text_update_s = time.monotonic()
+        self._update_text_views()
 
     def _update_dashboard_text(self, serial_state: dict[str, Any]) -> None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
@@ -3471,6 +4258,12 @@ class AirTrixxGUI:
 
         add("Camera", "source", self.camera_source_var.get())
         add("Camera", "mirror", self.camera_mirror_var.get())
+        add("Camera", "width", self.config.camera_width)
+        add("Camera", "height", self.config.camera_height)
+        add("Camera", "tracking_frame_skip", self.config.tracking_frame_skip)
+        add("Camera", "preview_fps", self.config.preview_fps)
+        add("Camera", "face_detection_enabled", self.hand_tracker.face_detection_enabled)
+        add("Camera", "face_detection_after_centering", self.config.face_detection_enabled_after_centering)
         add("Camera", "centering", self.camera_centering_status_var.get())
         add("Camera", "face_visible", face.get("visible"))
         add("Camera", "face_x", face.get("x"))
@@ -3590,6 +4383,42 @@ class AirTrixxGUI:
         hand_state = self.hand_tracker.get_latest_hands()
         return self.fusion_state.build_snapshot(serial_state, hand_state)
 
+    def _apply_runtime_performance_settings(self) -> None:
+        width = self._calibration_int("camera_width", self.config.camera_width, 160, 1920)
+        height = self._calibration_int("camera_height", self.config.camera_height, 120, 1080)
+        tracking_frame_skip = self._calibration_int("tracking_frame_skip", self.config.tracking_frame_skip, 0, 8)
+        preview_fps = self._calibration_int("preview_fps", self.config.preview_fps, 1, 60)
+        face_after_centering = self._calibration_bool("face_detection_enabled_after_centering", False)
+        face_detection_enabled = self.camera_centering_active or face_after_centering
+
+        self.config.camera_width = width
+        self.config.camera_height = height
+        self.config.tracking_frame_skip = tracking_frame_skip
+        self.config.preview_fps = preview_fps
+        self.config.face_detection_enabled_after_centering = face_after_centering
+
+        self.hand_tracker.configure(
+            width=width,
+            height=height,
+            tracking_frame_skip=tracking_frame_skip,
+            face_detection_enabled=face_detection_enabled,
+        )
+        self.servo_controller.camera_width = width
+        self.servo_controller.camera_height = height
+
+    def _calibration_int(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(float(self.config.calibration.get(key, default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _calibration_bool(self, key: str, default: bool) -> bool:
+        try:
+            return int(float(self.config.calibration.get(key, 1 if default else 0))) != 0
+        except (TypeError, ValueError):
+            return default
+
     def _apply_calibration_entries(self) -> dict[str, Any] | None:
         calibration: dict[str, Any] = dict(self.config.calibration)
         try:
@@ -3604,6 +4433,7 @@ class AirTrixxGUI:
             return None
         self.config.calibration = calibration
         self.servo_controller.update_calibration(calibration)
+        self._apply_runtime_performance_settings()
         return calibration
 
     def _drain_log_queue(self) -> None:

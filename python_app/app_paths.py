@@ -113,13 +113,17 @@ def migrate_legacy_runtime_files(paths: AppPaths) -> list[str]:
             migrated.append(f"{source} -> {target}")
 
     legacy_gestures = legacy_data_dir / "gestures"
-    if legacy_gestures.exists() and not any(paths.gesture_data_dir.iterdir()):
-        for item in legacy_gestures.iterdir():
-            target = paths.gesture_data_dir / item.name
-            if item.is_dir():
-                shutil.copytree(item, target, dirs_exist_ok=True)
-                migrated.append(f"{item} -> {target}")
-            elif item.is_file():
-                shutil.copy2(item, target)
-                migrated.append(f"{item} -> {target}")
+    if legacy_gestures.exists():
+        copied_count = 0
+        for source_file in legacy_gestures.rglob("*"):
+            if not source_file.is_file():
+                continue
+            target = paths.gesture_data_dir / source_file.relative_to(legacy_gestures)
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, target)
+            copied_count += 1
+        if copied_count:
+            migrated.append(f"{legacy_gestures} -> {paths.gesture_data_dir} ({copied_count} gesture samples)")
     return migrated

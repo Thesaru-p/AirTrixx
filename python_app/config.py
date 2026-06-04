@@ -54,6 +54,11 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "tof_depth_alpha": 0.45,
     "use_startup_user_distance": 1,
     "startup_distance_live_weight": 0.35,
+    "tracking_frame_skip": 1,
+    "preview_fps": 10,
+    "face_detection_enabled_after_centering": 0,
+    "camera_width": 424,
+    "camera_height": 240,
     "prediction_latency_ms": 50.0,
     "camera_horizontal_fov_deg": 70.0,
     "camera_vertical_fov_deg": 43.0,
@@ -102,8 +107,11 @@ class AppConfig:
     serial_port: str | None = None
     serial_baud: int = 921600
     camera_index: int = 1
-    camera_width: int = 640
-    camera_height: int = 480
+    camera_width: int = 424
+    camera_height: int = 240
+    tracking_frame_skip: int = 1
+    preview_fps: int = 10
+    face_detection_enabled_after_centering: bool = False
     horizontal_fov_deg: float = 70.0
     vertical_fov_deg: float = 43.0
     servo_min_tick: int = 0
@@ -145,6 +153,20 @@ def _merged_calibration(data: dict[str, Any] | None) -> dict[str, Any]:
             if key in merged:
                 merged[key] = value
     return merged
+
+
+def _calibration_int(
+    calibration: dict[str, Any],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(float(calibration.get(key, default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, Any]:
@@ -190,6 +212,13 @@ def load_app_config() -> AppConfig:
     startup_warnings = [f"Migrated runtime file: {item}" for item in warnings]
     startup_warnings.extend(calibration_warnings)
     return AppConfig(
+        camera_width=_calibration_int(calibration, "camera_width", 424, 160, 1920),
+        camera_height=_calibration_int(calibration, "camera_height", 240, 120, 1080),
+        tracking_frame_skip=_calibration_int(calibration, "tracking_frame_skip", 1, 0, 8),
+        preview_fps=_calibration_int(calibration, "preview_fps", 10, 1, 60),
+        face_detection_enabled_after_centering=bool(
+            _calibration_int(calibration, "face_detection_enabled_after_centering", 0, 0, 1)
+        ),
         user_data_dir=PATHS.user_data_dir,
         config_dir=PATHS.config_dir,
         logs_dir=PATHS.logs_dir,

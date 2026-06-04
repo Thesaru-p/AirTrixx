@@ -22,7 +22,7 @@ class AppPathTests(unittest.TestCase):
             {"APPDATA": r"C:\Users\tester\AppData\Roaming"},
             clear=True,
         ):
-            self.assertEqual(str(user_data_root()), r"C:\Users\tester\AppData\Roaming/AirTrixx")
+            self.assertEqual(user_data_root(), Path(r"C:\Users\tester\AppData\Roaming") / "AirTrixx")
 
     def test_macos_user_data_uses_application_support(self) -> None:
         with patch("app_paths.platform.system", return_value="Darwin"), patch("app_paths.Path.home", return_value=Path("/Users/tester")):
@@ -35,6 +35,7 @@ class AppPathTests(unittest.TestCase):
         self.assertEqual(paths.mapping_path, paths.config_dir / "input_mappings.json")
         self.assertEqual(paths.servo_debug_log_path, paths.logs_dir / "servo_debug.log")
         self.assertEqual(paths.audio_recording_path, paths.temp_dir / "last_esp32_recording.wav")
+        self.assertEqual(paths.gesture_data_dir, paths.user_data_dir / "gestures")
 
 
 class ConfigTests(unittest.TestCase):
