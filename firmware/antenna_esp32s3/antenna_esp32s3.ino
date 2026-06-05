@@ -43,6 +43,12 @@ struct LatestKeyboard {
   KeyboardTofPacket packet = {};
 };
 
+struct LatestChargingDock {
+  bool seen = false;
+  uint32_t received_ms = 0;
+  ChargingDockStatusPacket packet = {};
+};
+
 struct LatestAudioDock {
   bool seen = false;
   uint32_t received_ms = 0;
@@ -64,6 +70,7 @@ static LatestBatteryStatus latestWristbandBattery;
 static LatestCamDock latestCamDock;
 static LatestFans latestFans;
 static LatestKeyboard latestKeyboard;
+static LatestChargingDock latestChargingDock;
 static LatestAudioDock latestAudioDock;
 static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -574,6 +581,18 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     latestKeyboard.seen = true;
     latestKeyboard.received_ms = millis();
     portEXIT_CRITICAL(&stateMux);
+  } else if (header.msg_type == MSG_CHARGING_DOCK_STATUS &&
+             len == static_cast<int>(sizeof(ChargingDockStatusPacket))) {
+    ChargingDockStatusPacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.header.device_id != DEVICE_CHARGING_DOCK) {
+      return;
+    }
+    portENTER_CRITICAL(&stateMux);
+    latestChargingDock.packet = packet;
+    latestChargingDock.seen = true;
+    latestChargingDock.received_ms = millis();
+    portEXIT_CRITICAL(&stateMux);
   } else if (header.msg_type == MSG_FAN_STATUS && len == static_cast<int>(sizeof(FanStatusPacket))) {
     FanStatusPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
@@ -976,6 +995,169 @@ void printFansJson(const LatestFans &snapshot, uint32_t nowMs) {
   Serial.print("}}");
 }
 
+const char *chargingDockChannelName(uint8_t index) {
+  switch (index) {
+    case 0: return "FN";
+    case 1: return "AD";
+    case 2: return "KB";
+    case 3: return "WB";
+    default: return "CH";
+  }
+}
+
+bool maskHas(uint8_t mask, uint8_t index) {
+  return (mask & (1 << index)) != 0;
+}
+
+const char *chargingDockInput(const ChargingDockStatusPacket &packet, bool ok) {
+  if (!ok) {
+    return "off";
+  }
+  if (packet.hot_mask != 0) {
+    return "hot";
+  }
+  if (packet.charging_mask != 0) {
+    return "charging";
+  }
+  return "idle";
+}
+
+const char *chargingDockChannelStatus(const ChargingDockStatusPacket &packet, bool ok, uint8_t index) {
+  if (!ok) {
+    return "not_connected";
+  }
+  if (!maskHas(packet.ina_valid_mask, index)) {
+    return "ina_error";
+  }
+  if (maskHas(packet.hot_mask, index)) {
+    return "hot";
+  }
+  if (!maskHas(packet.battery_present_mask, index)) {
+    return "no_battery";
+  }
+  if (maskHas(packet.full_mask, index)) {
+    return "full";
+  }
+  if (maskHas(packet.charging_mask, index)) {
+    return "charging";
+  }
+  return "idle";
+}
+
+void printChargingDockJson(const LatestChargingDock &snapshot, uint32_t nowMs) {
+  bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
+  const ChargingDockStatusPacket &packet = snapshot.packet;
+  uint16_t presentCount = 0;
+  uint16_t chargingCount = 0;
+  uint16_t percentSum = 0;
+  uint32_t mvSum = 0;
+
+  if (ok) {
+    for (uint8_t i = 0; i < AIRTRIXX_CHARGING_DOCK_CHANNELS; ++i) {
+      if (maskHas(packet.battery_present_mask, i)) {
+        presentCount++;
+        percentSum += packet.battery_percent[i];
+        mvSum += packet.battery_mv[i];
+      }
+      if (maskHas(packet.charging_mask, i)) {
+        chargingCount++;
+      }
+    }
+  }
+
+  Serial.print("\"charging_dock\":{");
+  Serial.print("\"status\":\"");
+  Serial.print(ok ? "ok" : "not_connected");
+  Serial.print("\",\"input\":\"");
+  Serial.print(chargingDockInput(packet, ok));
+  Serial.print("\",\"battery_level\":");
+  if (presentCount > 0) {
+    Serial.print(static_cast<int>((percentSum + (presentCount / 2)) / presentCount));
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"battery_voltage\":");
+  if (presentCount > 0) {
+    Serial.print((static_cast<float>(mvSum) / presentCount) / 1000.0f, 3);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"sequence\":");
+  if (ok) {
+    Serial.print(packet.header.sequence);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"t_ms\":");
+  if (ok) {
+    Serial.print(packet.header.t_ms);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"active_tab\":");
+  if (ok) {
+    Serial.print(packet.active_tab);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"priority_channel\":");
+  if (ok && packet.priority_channel >= 0 &&
+      packet.priority_channel < static_cast<int8_t>(AIRTRIXX_CHARGING_DOCK_CHANNELS)) {
+    Serial.print("\"");
+    Serial.print(chargingDockChannelName(packet.priority_channel));
+    Serial.print("\"");
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"present_count\":");
+  Serial.print(ok ? presentCount : 0);
+  Serial.print(",\"charging_count\":");
+  Serial.print(ok ? chargingCount : 0);
+  Serial.print(",\"channels\":[");
+  for (uint8_t i = 0; i < AIRTRIXX_CHARGING_DOCK_CHANNELS; ++i) {
+    if (i > 0) {
+      Serial.print(",");
+    }
+    bool inaValid = ok && maskHas(packet.ina_valid_mask, i);
+    bool batteryPresent = ok && maskHas(packet.battery_present_mask, i);
+    bool tempValid = ok && maskHas(packet.temp_valid_mask, i);
+    Serial.print("{\"name\":\"");
+    Serial.print(chargingDockChannelName(i));
+    Serial.print("\",\"status\":\"");
+    Serial.print(chargingDockChannelStatus(packet, ok, i));
+    Serial.print("\",\"charging\":");
+    Serial.print(ok && maskHas(packet.charging_mask, i) ? "true" : "false");
+    Serial.print(",\"battery_level\":");
+    if (batteryPresent) {
+      Serial.print(packet.battery_percent[i]);
+    } else {
+      Serial.print("null");
+    }
+    Serial.print(",\"battery_voltage\":");
+    if (batteryPresent) {
+      Serial.print(packet.battery_mv[i] / 1000.0f, 3);
+    } else {
+      Serial.print("null");
+    }
+    Serial.print(",\"current_ma\":");
+    if (inaValid) {
+      Serial.print(packet.current_ma[i]);
+    } else {
+      Serial.print("null");
+    }
+    Serial.print(",\"temp_c\":");
+    if (tempValid) {
+      Serial.print(packet.temp_centi_c[i] / 100.0f, 2);
+    } else {
+      Serial.print("null");
+    }
+    Serial.print(",\"energy_mah\":");
+    Serial.print(ok ? packet.energy_mah[i] : 0);
+    Serial.print("}");
+  }
+  Serial.print("]}");
+}
+
 void printFutureDeviceJson(const char *name) {
   Serial.print("\"");
   Serial.print(name);
@@ -1017,6 +1199,7 @@ void printJsonState() {
   LatestCamDock camSnapshot;
   LatestFans fansSnapshot;
   LatestKeyboard keyboardSnapshot;
+  LatestChargingDock chargingDockSnapshot;
   LatestAudioDock audiodockSnapshot;
   uint32_t nowMs = millis();
 
@@ -1026,6 +1209,7 @@ void printJsonState() {
   camSnapshot = latestCamDock;
   fansSnapshot = latestFans;
   keyboardSnapshot = latestKeyboard;
+  chargingDockSnapshot = latestChargingDock;
   audiodockSnapshot = latestAudioDock;
   portEXIT_CRITICAL(&stateMux);
 
@@ -1051,7 +1235,7 @@ void printJsonState() {
     Serial.print(",");
     printKeyboardJson(keyboardSnapshot, nowMs);
     Serial.print(",");
-    printFutureDeviceJson("charging_dock");
+    printChargingDockJson(chargingDockSnapshot, nowMs);
     Serial.print(",");
     printAudioDockJson(audiodockSnapshot, nowMs);
     Serial.print(",");
@@ -1095,6 +1279,7 @@ void setup() {
   addEspNowPeer(CAMDOCK_MAC_PLACEHOLDER);
   addEspNowPeer(WRISTBAND_MAC_PLACEHOLDER);
   addEspNowPeer(KEYBOARD_MAC_PLACEHOLDER);
+  addEspNowPeer(CHARGING_DOCK_MAC_PLACEHOLDER);
   addEspNowPeer(FANS_MAC_PLACEHOLDER);
   addEspNowPeer(AUDIODOCK_MAC_PLACEHOLDER);
   addEspNowPeer(ESPNOW_BROADCAST_MAC);

@@ -22,7 +22,7 @@ static uint8_t CAMDOCK_MAC_PLACEHOLDER[6]       = {0x10,0x20,0xBA,0x4C,0x5B,0xF4
 // static uint8_t WRISTBAND_MAC_PLACEHOLDER[6]     = {0x08,0x92,0x72,0x85,0xAE,0xB8};
 static uint8_t WRISTBAND_MAC_PLACEHOLDER[6]     = {0x1C,0xDB,0xD4,0xD4,0xF2,0x0C}; //new
 static uint8_t KEYBOARD_MAC_PLACEHOLDER[6]      = {0x10, 0x20, 0xBA, 0x4D, 0xFC, 0xA8};
-static uint8_t CHARGING_DOCK_MAC_PLACEHOLDER[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x05};
+static uint8_t CHARGING_DOCK_MAC_PLACEHOLDER[6] = {0x30, 0xED, 0xA0, 0xB9, 0xCB, 0xD8};
 static uint8_t AUDIODOCK_MAC_PLACEHOLDER[6]     = {0x30, 0xED, 0xA0, 0xB9, 0xCC, 0x3C};
 static uint8_t FANS_MAC_PLACEHOLDER[6]          = {0x10, 0x00, 0x3B, 0xAF, 0x94, 0x20};
 
@@ -132,4 +132,5 @@ static const uint16_t CAMDOCK_REPORT_HZ = 30;
 static const uint16_t WRISTBAND_REPORT_HZ = 50;
 static const uint16_t FANS_REPORT_HZ = 2;
 static const uint16_t KEYBOARD_REPORT_HZ = 10;
+static const uint16_t CHARGING_DOCK_REPORT_HZ = 2;
 static const uint32_t DEVICE_TIMEOUT_MS = 1000;

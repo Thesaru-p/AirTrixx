@@ -209,6 +209,10 @@ class MappingAction:
     absolute_y: float = 0.5
     absolute_x_source: str = ""
     absolute_y_source: str = ""
+    absolute_x_invert: bool = False
+    absolute_y_invert: bool = False
+    absolute_deadband: float = 0.0
+    absolute_smoothing_alpha: float = 1.0
     continuous: bool = False
 
     @classmethod
@@ -218,6 +222,7 @@ class MappingAction:
         action_type = str(data.get("type", "keyboard_tap"))
         if action_type not in ACTION_TYPES:
             raise ValueError(f"unknown mapping action type: {action_type}")
+        smoothing_alpha = float(data.get("absolute_smoothing_alpha", 1.0) or 1.0)
         return cls(
             type=action_type,
             keys=parse_key_combo(data.get("keys", [])),
@@ -232,6 +237,10 @@ class MappingAction:
             absolute_y=max(0.0, min(1.0, float(data.get("absolute_y", 0.5) or 0.0))),
             absolute_x_source=str(data.get("absolute_x_source") or ""),
             absolute_y_source=str(data.get("absolute_y_source") or ""),
+            absolute_x_invert=bool(data.get("absolute_x_invert", False)),
+            absolute_y_invert=bool(data.get("absolute_y_invert", False)),
+            absolute_deadband=max(0.0, min(0.5, float(data.get("absolute_deadband", 0.0) or 0.0))),
+            absolute_smoothing_alpha=max(0.01, min(1.0, smoothing_alpha)),
             continuous=bool(data.get("continuous", False)),
         )
 
@@ -250,6 +259,10 @@ class MappingAction:
             "absolute_y": self.absolute_y,
             "absolute_x_source": self.absolute_x_source,
             "absolute_y_source": self.absolute_y_source,
+            "absolute_x_invert": self.absolute_x_invert,
+            "absolute_y_invert": self.absolute_y_invert,
+            "absolute_deadband": self.absolute_deadband,
+            "absolute_smoothing_alpha": self.absolute_smoothing_alpha,
             "continuous": self.continuous,
         }
 
@@ -283,7 +296,15 @@ class MappingAction:
             if self.absolute_x_source or self.absolute_y_source:
                 x_source = self.absolute_x_source or f"{self.absolute_x:.2f}"
                 y_source = self.absolute_y_source or f"{self.absolute_y:.2f}"
-                return f"follow {x_source},{y_source}"
+                flags = []
+                if self.absolute_x_invert:
+                    flags.append("invert x")
+                if self.absolute_y_invert:
+                    flags.append("invert y")
+                if self.absolute_deadband > 0.0:
+                    flags.append(f"deadband {self.absolute_deadband:g}")
+                suffix = f" ({', '.join(flags)})" if flags else ""
+                return f"follow {x_source},{y_source}{suffix}"
             return f"move absolute {self.absolute_x:.2f},{self.absolute_y:.2f}"
         return self.type
 
@@ -564,6 +585,8 @@ class _RuntimeState:
     last_process_s: float | None = None
     residual_x: float = 0.0
     residual_y: float = 0.0
+    absolute_x: float | None = None
+    absolute_y: float | None = None
     status: str = "idle"
 
 
@@ -788,6 +811,8 @@ class InputMapper:
             state.last_process_s = now_s
             state.residual_x = 0.0
             state.residual_y = 0.0
+            state.absolute_x = None
+            state.absolute_y = None
             state.enter_blocked = bool(gesture_name and not self._can_fire_gesture(gesture_name, now_s))
             if state.enter_blocked:
                 state.status = "gesture cooldown"
@@ -975,8 +1000,8 @@ class InputMapper:
             state.last_process_s = now_s
             self._move_relative(action, state, dt, now_s)
         elif action.type == "mouse_absolute" and action.continuous:
-            self._move_absolute(action, signals)
-            state.last_fired_s = now_s
+            if self._move_absolute(action, signals, state):
+                state.last_fired_s = now_s
 
     def _hold_keys(self, rule_id: str, tokens: list[str]) -> None:
         for token in tokens:
@@ -1011,7 +1036,8 @@ class InputMapper:
         self,
         action: MappingAction,
         signals: dict[str, SignalValue] | None = None,
-    ) -> None:
+        state: _RuntimeState | None = None,
+    ) -> bool:
         try:
             import tkinter as tk
 
@@ -1020,24 +1046,53 @@ class InputMapper:
             height = root.winfo_screenheight() if root is not None else 1080
         except Exception:
             width, height = 1920, 1080
-        absolute_x = self._absolute_axis_value(action.absolute_x, action.absolute_x_source, signals)
-        absolute_y = self._absolute_axis_value(action.absolute_y, action.absolute_y_source, signals)
+        absolute_x = self._absolute_axis_value(
+            action.absolute_x,
+            action.absolute_x_source,
+            signals,
+            invert=action.absolute_x_invert,
+        )
+        absolute_y = self._absolute_axis_value(
+            action.absolute_y,
+            action.absolute_y_source,
+            signals,
+            invert=action.absolute_y_invert,
+        )
+        if state is not None and action.continuous:
+            previous_x = state.absolute_x
+            previous_y = state.absolute_y
+            if previous_x is not None and previous_y is not None:
+                dx = absolute_x - previous_x
+                dy = absolute_y - previous_y
+                deadband = max(0.0, action.absolute_deadband)
+                if abs(dx) < deadband and abs(dy) < deadband:
+                    return False
+                alpha = max(0.01, min(1.0, action.absolute_smoothing_alpha))
+                absolute_x = previous_x + dx * alpha
+                absolute_y = previous_y + dy * alpha
+            state.absolute_x = absolute_x
+            state.absolute_y = absolute_y
         x = int(max(0.0, min(1.0, absolute_x)) * max(1, width - 1))
         y = int(max(0.0, min(1.0, absolute_y)) * max(1, height - 1))
         self.backend.move_absolute(x, y)
+        return True
 
     @staticmethod
     def _absolute_axis_value(
         fallback: float,
         source: str,
         signals: dict[str, SignalValue] | None,
+        *,
+        invert: bool = False,
     ) -> float:
+        value = fallback
         if source and signals:
             signal = signals.get(source)
             number = _to_number(signal.value) if signal is not None else None
             if number is not None:
-                return number
-        return fallback
+                value = number
+        value = max(0.0, min(1.0, value))
+        return 1.0 - value if invert else value
 
     def _log(self, message: str) -> None:
         if self.on_log:

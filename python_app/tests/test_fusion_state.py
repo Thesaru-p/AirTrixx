@@ -47,6 +47,14 @@ class FusionStateTests(unittest.TestCase):
         self.assertFalse(values["wrist_roll_dominant"])
         self.assertEqual(values["wrist_dominant_axis"], "none")
 
+    def test_charging_dock_input_comes_from_serial_state(self) -> None:
+        fusion = FusionState()
+        serial_state = serial_with_wrist(pitch=0, roll=0)
+        serial_state["devices"]["charging_dock"] = {"input": "charging"}
+        values = fusion.build_input_dict(serial_state, {}, now_s=0.0)
+
+        self.assertEqual(values["charging_dock_input"], "charging")
+
     def test_wrist_roll_delta_handles_angle_wrap(self) -> None:
         fusion = FusionState()
         fusion.build_input_dict(serial_with_wrist(pitch=0, roll=170), {}, now_s=0.0)

@@ -397,6 +397,33 @@ class InputMapperRuntimeTests(unittest.TestCase):
         mapper.process(snapshot(right_hand_z_mm=35, right_hand_x=0.25, right_hand_y=0.75), 0.0)
         self.assertEqual(backend.events, [("move_absolute", 479, 809)])
 
+    def test_mouse_absolute_can_invert_smooth_and_ignore_jitter(self) -> None:
+        rule = MappingRule(
+            source="fused.right_hand_z_mm",
+            comparator="lt",
+            threshold=400,
+            action=MappingAction(
+                type="mouse_absolute",
+                continuous=True,
+                absolute_x_source="fused.right_hand_x",
+                absolute_y_source="fused.right_hand_y",
+                absolute_x_invert=True,
+                absolute_deadband=0.03,
+                absolute_smoothing_alpha=0.5,
+            ),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(snapshot(right_hand_z_mm=350, right_hand_x=0.25, right_hand_y=0.50), 0.0)
+        mapper.process(snapshot(right_hand_z_mm=350, right_hand_x=0.27, right_hand_y=0.51), 0.1)
+        mapper.process(snapshot(right_hand_z_mm=350, right_hand_x=0.35, right_hand_y=0.50), 0.2)
+        self.assertEqual(
+            backend.events,
+            [
+                ("move_absolute", 1439, 539),
+                ("move_absolute", 1343, 539),
+            ],
+        )
+
     def test_hand_z_signal_requires_visible_hand(self) -> None:
         hidden = SignalCatalog.flatten(hand_snapshot({"right_hand_z_mm": 700}, right_visible=False))
         visible = SignalCatalog.flatten(hand_snapshot({"right_hand_z_mm": 700}, right_visible=True))

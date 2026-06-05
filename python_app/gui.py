@@ -676,6 +676,7 @@ class AirTrixxGUI:
             ("camdock", "Cam Dock"),
             ("keyboard", "Keyboard"),
             ("fans", "Fans"),
+            ("charging_dock", "Charging Dock"),
             ("camera", "Camera"),
             ("audiodock", "Audio Dock"),
         )
@@ -1057,7 +1058,7 @@ class AirTrixxGUI:
         self.live_data_device_combo = ttk.Combobox(
             filter_bar,
             textvariable=self.live_data_device_var,
-            values=("All", "Antenna", "Wristband", "Cam Dock", "Keyboard", "Fans", "Camera", "Calibration", "MediaPipe", "Gesture Recorder", "Fused Input"),
+            values=("All", "Antenna", "Wristband", "Cam Dock", "Keyboard", "Fans", "Charging Dock", "Camera", "Calibration", "MediaPipe", "Gesture Recorder", "Fused Input"),
             state="readonly",
             width=18,
         )
@@ -1949,7 +1950,7 @@ class AirTrixxGUI:
         working = copy.deepcopy(rule)
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Mapping" if is_new else "Edit Mapping")
-        dialog.geometry("980x780")
+        dialog.geometry("980x840")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(0, weight=1)
@@ -1982,6 +1983,10 @@ class AirTrixxGUI:
         absolute_y_var = tk.StringVar(value=str(working.action.absolute_y))
         absolute_x_source_var = tk.StringVar(value=working.action.absolute_x_source)
         absolute_y_source_var = tk.StringVar(value=working.action.absolute_y_source)
+        absolute_x_invert_var = tk.BooleanVar(value=working.action.absolute_x_invert)
+        absolute_y_invert_var = tk.BooleanVar(value=working.action.absolute_y_invert)
+        absolute_deadband_var = tk.StringVar(value=str(working.action.absolute_deadband))
+        absolute_smoothing_alpha_var = tk.StringVar(value=str(working.action.absolute_smoothing_alpha))
         continuous_var = tk.BooleanVar(value=working.action.continuous)
         status_var = tk.StringVar(value="")
         source_options = self._rule_dialog_sources(working)
@@ -2156,6 +2161,18 @@ class AirTrixxGUI:
             row=row, column=3, sticky="ew", pady=4
         )
         row += 1
+        ttk.Checkbutton(frame, text="Invert absolute X", variable=absolute_x_invert_var).grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+        ttk.Checkbutton(frame, text="Invert absolute Y", variable=absolute_y_invert_var).grid(
+            row=row, column=3, sticky="w", pady=4
+        )
+        row += 1
+        add_label(row, "Absolute deadband")
+        ttk.Entry(frame, textvariable=absolute_deadband_var, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Smoothing alpha", 2)
+        ttk.Entry(frame, textvariable=absolute_smoothing_alpha_var, width=18).grid(row=row, column=3, sticky="ew", pady=4)
+        row += 1
         ttk.Checkbutton(frame, text="Continuous absolute move", variable=continuous_var).grid(
             row=row, column=1, columnspan=3, sticky="w", pady=4
         )
@@ -2268,6 +2285,10 @@ class AirTrixxGUI:
                     "absolute_y": absolute_y_var.get(),
                     "absolute_x_source": absolute_x_source_var.get().strip(),
                     "absolute_y_source": absolute_y_source_var.get().strip(),
+                    "absolute_x_invert": absolute_x_invert_var.get(),
+                    "absolute_y_invert": absolute_y_invert_var.get(),
+                    "absolute_deadband": absolute_deadband_var.get(),
+                    "absolute_smoothing_alpha": absolute_smoothing_alpha_var.get(),
                     "continuous": continuous_var.get(),
                 }
             )
@@ -4543,6 +4564,7 @@ class AirTrixxGUI:
         wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
         camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
         keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
+        charging_dock = devices.get("charging_dock", {}) if isinstance(devices, dict) else {}
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         wrist_accel = wrist.get("accel", {}) if isinstance(wrist, dict) else {}
         wrist_gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
@@ -4595,6 +4617,28 @@ class AirTrixxGUI:
         for sensor_index in range(1, 5):
             add("Keyboard", f"sensor_{sensor_index}_mm", keyboard_tof.get(f"sensor_{sensor_index}_mm") if isinstance(keyboard_tof, dict) else None)
             add("Keyboard", f"sensor_{sensor_index}_valid", keyboard_valid.get(f"sensor_{sensor_index}") if isinstance(keyboard_valid, dict) else None)
+
+        add("Charging Dock", "status", charging_dock.get("status") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "input", charging_dock.get("input") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "sequence", charging_dock.get("sequence") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "battery_level", charging_dock.get("battery_level") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "battery_voltage", charging_dock.get("battery_voltage") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "active_tab", charging_dock.get("active_tab") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "priority_channel", charging_dock.get("priority_channel") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "present_count", charging_dock.get("present_count") if isinstance(charging_dock, dict) else None)
+        add("Charging Dock", "charging_count", charging_dock.get("charging_count") if isinstance(charging_dock, dict) else None)
+        charging_channels = charging_dock.get("channels", []) if isinstance(charging_dock, dict) else []
+        if isinstance(charging_channels, list):
+            for channel in charging_channels:
+                if not isinstance(channel, dict):
+                    continue
+                channel_name = str(channel.get("name", "CH")).upper()
+                add("Charging Dock", f"{channel_name}_status", channel.get("status"))
+                add("Charging Dock", f"{channel_name}_battery_level", channel.get("battery_level"))
+                add("Charging Dock", f"{channel_name}_battery_voltage", channel.get("battery_voltage"))
+                add("Charging Dock", f"{channel_name}_current_ma", channel.get("current_ma"))
+                add("Charging Dock", f"{channel_name}_temp_c", channel.get("temp_c"))
+                add("Charging Dock", f"{channel_name}_energy_mah", channel.get("energy_mah"))
 
         add("Fans", "status", fans.get("status") if isinstance(fans, dict) else None)
         add("Fans", "fan_on", fans.get("fan_on") if isinstance(fans, dict) else None)
