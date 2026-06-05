@@ -16,7 +16,7 @@ DEVICE_LABELS = {
     "wristband": "Wristband ESP-NOW",
     "camdock": "Cam Dock ESP-NOW",
     "keyboard": "Keyboard",
-    "charging_dock": "Charging Dock TBD",
+    "charging_dock": "Charging Dock ESP-NOW",
     "audiodock": "Audio Dock TBD",
     "fans": "Fans TBD",
 }
@@ -230,6 +230,16 @@ class ConnectionStatusApp:
                 )
         if device == "wristband":
             return f"pitch {payload.get('pitch', '-')}, roll {payload.get('roll', '-')}"
+        if device == "charging_dock":
+            channels = payload.get("channels", [])
+            if isinstance(channels, list):
+                parts = [
+                    f"{channel.get('name', 'CH')} {channel.get('status', '-')}"
+                    for channel in channels
+                    if isinstance(channel, dict)
+                ]
+                summary = ", ".join(parts[:4])
+                return f"{payload.get('input', '-')}: {summary}" if summary else str(payload.get("input", "-"))
         return str(payload.get("input", "-"))
 
     def _format_battery(self, payload: dict[str, Any]) -> str:

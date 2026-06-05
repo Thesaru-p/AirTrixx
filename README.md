@@ -8,6 +8,7 @@ AirTrixx is a multi-sensor laptop control prototype that combines:
 - a Wristband ESP32-C3 with MPU6050 IMU sensing and periodic battery telemetry
 - a Fan Controller ESP32-C3 with DS18B20 temperature telemetry and GUI on/off control
 - a Keyboard ESP32-S3 with three VL53L0X ToF lanes through a TCA9548A mux
+- a Charging Dock ESP32-S3 with four INA219 charging channels and ESP-NOW status telemetry
 - a packaged Python desktop app using Tkinter, OpenCV, MediaPipe Tasks, pyserial, NumPy, Pillow, and pynput
 
 The current firmware targets are:
@@ -17,10 +18,11 @@ The current firmware targets are:
 - `firmware/wristband_esp32c3/wristband_esp32c3.ino`
 - `firmware/fan_controller_esp32c3/fan_controller_esp32c3.ino`
 - `firmware/keyboard_esp32s3/keyboard_esp32s3.ino`
+- `firmware/charging_dock_esp32s3/src/main.cpp`
 - `firmware/mac_finder/mac_finder.ino`
 
-Future devices are represented in the Antenna JSON model as placeholders only:
-charging dock and audio dock.
+Future devices are represented in the Antenna JSON model as placeholders only
+until their firmware target is active.
 
 ## Repo Layout
 
@@ -77,6 +79,7 @@ static uint8_t CAMDOCK_MAC_PLACEHOLDER[6] = {...};
 static uint8_t WRISTBAND_MAC_PLACEHOLDER[6] = {...};
 static uint8_t FANS_MAC_PLACEHOLDER[6] = {...};
 static uint8_t KEYBOARD_MAC_PLACEHOLDER[6] = {...};
+static uint8_t CHARGING_DOCK_MAC_PLACEHOLDER[6] = {...};
 ```
 
 Keep `ESPNOW_CHANNEL = 1` on every target.
@@ -94,6 +97,7 @@ Flash in this order:
 5. Flash `firmware/wristband_esp32c3/wristband_esp32c3.ino` to the Wristband ESP32-C3.
 6. Flash `firmware/fan_controller_esp32c3/fan_controller_esp32c3.ino` to the Fan Controller ESP32-C3.
 7. Flash `firmware/keyboard_esp32s3/keyboard_esp32s3.ino` to the Keyboard ESP32-S3.
+8. Flash `firmware/charging_dock_esp32s3` to the Charging Dock ESP32-S3 with PlatformIO.
 
 If your Arduino IDE cannot resolve the shared headers from `firmware/shared`, copy `AirTrixxConfig.h` and `AirTrixxProtocol.h` into the sketch folder you are compiling, or compile with Arduino CLI from the repo so the relative include paths are preserved.
 
@@ -129,6 +133,7 @@ The GUI provides:
 - per-signal keyboard and mouse mappings with tap, hold, repeat, scroll, and movement actions
 - fan on/off control, live temperature readings, and wireless fan firmware flash
 - keyboard ToF live data and a 0-300 mm distance grid
+- charging dock connection and per-channel charging status
 - camera center command
 - servo calibration save/load
 - labeled gesture recording under `python_app/data/gestures`

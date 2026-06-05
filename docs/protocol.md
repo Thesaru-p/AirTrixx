@@ -36,6 +36,12 @@ Message types:
 | `MSG_OTA_START` | 7 |
 | `MSG_FAN_STATUS` | 8 |
 | `MSG_FAN_COMMAND` | 9 |
+| `MSG_OTA_CHUNK` | 10 |
+| `MSG_KEYBOARD_TOF` | 11 |
+| `MSG_AUDIODOCK_DATA` | 12 |
+| `MSG_AUDIODOCK_AUDIO_CHUNK` | 13 |
+| `MSG_AUDIODOCK_TRANSCRIPT` | 14 |
+| `MSG_CHARGING_DOCK_STATUS` | 15 |
 
 Active servo pairs:
 
@@ -160,6 +166,31 @@ struct FanCommandPacket {
 };
 ```
 
+## Charging Dock
+
+The charging dock sends this status packet at about 2 Hz:
+
+```cpp
+struct ChargingDockStatusPacket {
+  AirTrixxPacketHeader header;
+  uint8_t active_tab;
+  int8_t priority_channel;
+  uint8_t ina_valid_mask;
+  uint8_t battery_present_mask;
+  uint8_t charging_mask;
+  uint8_t full_mask;
+  uint8_t hot_mask;
+  uint8_t temp_valid_mask;
+  uint8_t battery_percent[4];
+  uint16_t battery_mv[4];
+  int16_t current_ma[4];
+  int16_t temp_centi_c[4];
+  uint16_t energy_mah[4];
+};
+```
+
+The four channels are reported as `FN`, `AD`, `KB`, and `WB`.
+
 ## Servo Commands
 
 PC JSON commands are parsed by the Antenna and converted to:
@@ -236,7 +267,30 @@ Example:
       "active_target": "right"
     },
     "keyboard": {"status": "TBD", "input": "TBD", "battery_level": null},
-    "charging_dock": {"status": "TBD", "input": "TBD", "battery_level": null},
+    "charging_dock": {
+      "status": "ok",
+      "input": "charging",
+      "battery_level": 72,
+      "battery_voltage": 3.921,
+      "sequence": 20,
+      "t_ms": 123448,
+      "active_tab": 0,
+      "priority_channel": null,
+      "present_count": 4,
+      "charging_count": 2,
+      "channels": [
+        {
+          "name": "FN",
+          "status": "charging",
+          "charging": true,
+          "battery_level": 71,
+          "battery_voltage": 3.912,
+          "current_ma": 220,
+          "temp_c": 31.50,
+          "energy_mah": 140
+        }
+      ]
+    },
     "audiodock": {"status": "TBD", "input": "TBD", "battery_level": null},
     "fans": {
       "status": "ok",

@@ -5,6 +5,18 @@
 #include <Adafruit_INA219.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <math.h>
+
+#if __has_include("../../shared/AirTrixxConfig.h")
+#include "../../shared/AirTrixxConfig.h"
+#include "../../shared/AirTrixxProtocol.h"
+#else
+#include "AirTrixxConfig.h"
+#include "AirTrixxProtocol.h"
+#endif
 
 static const uint8_t CHANNEL_COUNT = 4;
 
@@ -31,7 +43,9 @@ static const float MIN_MAH_CURRENT_MA = 20.0f;
 static const uint32_t SENSOR_INTERVAL_MS = 500;
 static const uint32_t DISPLAY_INTERVAL_MS = 250;
 static const uint32_t STATUS_INTERVAL_MS = 2000;
+static const uint32_t REPORT_INTERVAL_MS = 1000UL / CHARGING_DOCK_REPORT_HZ;
 static const uint32_t BUTTON_DEBOUNCE_MS = 250;
+static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 
 // Gate MOSFETs are active-low in the supplied sketch.
 static const uint8_t GATE_ON_LEVEL = LOW;
@@ -70,7 +84,74 @@ static uint32_t lastTickMs = 0;
 static uint32_t lastSensorMs = 0;
 static uint32_t lastDisplayMs = 0;
 static uint32_t lastStatusMs = 0;
+static uint32_t lastReportMs = 0;
 static uint32_t lastButtonMs = 0;
+static uint16_t chargingDockSequence = 0;
+static uint32_t espNowSendOkCount = 0;
+static uint32_t espNowSendFailCount = 0;
+static bool espNowReady = false;
+
+static void printMacAddress(const uint8_t mac[6]) {
+  for (int i = 0; i < 6; ++i) {
+    if (i > 0) {
+      Serial.print(":");
+    }
+    if (mac[i] < 0x10) {
+      Serial.print("0");
+    }
+    Serial.print(mac[i], HEX);
+  }
+}
+
+static void configureWiFiChannel() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect();
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+
+  uint8_t mac[6] = {};
+  WiFi.macAddress(mac);
+  Serial.print("[CHG] WiFi STA MAC=");
+  printMacAddress(mac);
+  Serial.print(", channel=");
+  Serial.println(ESPNOW_CHANNEL);
+}
+
+static bool addEspNowPeer(const uint8_t mac[6]) {
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt = false;
+  peer.ifidx = WIFI_IF_STA;
+  esp_err_t result = esp_now_add_peer(&peer);
+  if (result != ESP_OK) {
+    Serial.println("[CHG] ESP-NOW add antenna peer failed, err=" + String(result));
+    return false;
+  }
+  return true;
+}
+
+static void initializeEspNow() {
+  configureWiFiChannel();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[CHG] ESP-NOW init failed; local charging still enabled");
+    espNowReady = false;
+    return;
+  }
+  espNowReady = addEspNowPeer(ANTENNA_MAC_PLACEHOLDER);
+  Serial.println(espNowReady ? "[CHG] ESP-NOW antenna peer ready" :
+                               "[CHG] ESP-NOW antenna peer unavailable");
+}
 
 static void setGate(uint8_t ch, bool enabled) {
   gateEnabled[ch] = enabled;
@@ -109,6 +190,26 @@ static int batteryPercent(float volts) {
     return 100;
   }
   return static_cast<int>(((volts - 3.20f) * 100.0f / 1.0f) + 0.5f);
+}
+
+static uint16_t clampUint16(float value) {
+  if (value <= 0.0f) {
+    return 0;
+  }
+  if (value >= 65535.0f) {
+    return 65535;
+  }
+  return static_cast<uint16_t>(lroundf(value));
+}
+
+static int16_t clampInt16(float value) {
+  if (value <= -32768.0f) {
+    return -32768;
+  }
+  if (value >= 32767.0f) {
+    return 32767;
+  }
+  return static_cast<int16_t>(lroundf(value));
 }
 
 static bool hasUsableTemp(uint8_t ch) {
@@ -322,7 +423,71 @@ static void printStatus() {
       Serial.print("temp_err");
     }
   }
+  Serial.print(" espnow=");
+  Serial.print(espNowReady ? "ready" : "off");
+  Serial.print(" send_ok/fail=");
+  Serial.print(espNowSendOkCount);
+  Serial.print("/");
+  Serial.print(espNowSendFailCount);
   Serial.println();
+}
+
+static void sendChargingDockStatus() {
+  if (!espNowReady) {
+    return;
+  }
+
+  ChargingDockStatusPacket packet = {};
+  bool batteryLow = false;
+  fillHeader(packet.header,
+             MSG_CHARGING_DOCK_STATUS,
+             DEVICE_CHARGING_DOCK,
+             ++chargingDockSequence,
+             millis(),
+             false);
+  packet.active_tab = static_cast<uint8_t>(activeTab);
+  packet.priority_channel = static_cast<int8_t>(priorityCH);
+
+  for (uint8_t i = 0; i < CHANNEL_COUNT && i < AIRTRIXX_CHARGING_DOCK_CHANNELS; ++i) {
+    uint8_t bit = 1 << i;
+    bool batteryPresent = inaReady[i] && !noBattery[i];
+    if (inaReady[i]) {
+      packet.ina_valid_mask |= bit;
+    }
+    if (batteryPresent) {
+      packet.battery_present_mask |= bit;
+    }
+    if (gateEnabled[i]) {
+      packet.charging_mask |= bit;
+    }
+    if (fullOrIdle[i]) {
+      packet.full_mask |= bit;
+    }
+    if (hotCutoff[i]) {
+      packet.hot_mask |= bit;
+    }
+    if (tempValid[i]) {
+      packet.temp_valid_mask |= bit;
+    }
+
+    uint8_t percent = batteryPresent ? static_cast<uint8_t>(batteryPercent(batteryV[i])) : 0;
+    packet.battery_percent[i] = percent;
+    packet.battery_mv[i] = batteryPresent ? clampUint16(batteryV[i] * 1000.0f) : 0;
+    packet.current_ma[i] = inaReady[i] ? clampInt16(currentmA[i]) : 0;
+    packet.temp_centi_c[i] = tempValid[i] ? clampInt16(curTemp[i] * 100.0f) : 0;
+    packet.energy_mah[i] = clampUint16(mah[i]);
+    batteryLow = batteryLow || (batteryPresent && percent <= 15);
+  }
+  packet.header.battery_low = batteryLow ? 1 : 0;
+
+  esp_err_t result = esp_now_send(ANTENNA_MAC_PLACEHOLDER,
+                                  reinterpret_cast<const uint8_t *>(&packet),
+                                  sizeof(packet));
+  if (result == ESP_OK) {
+    espNowSendOkCount++;
+  } else {
+    espNowSendFailCount++;
+  }
 }
 
 void setup() {
@@ -330,6 +495,7 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.println("[CHG] ESP32-S3 smart charging dock booting");
+  initializeEspNow();
 
   for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
     pinMode(GATE_PINS[i], OUTPUT);
@@ -373,6 +539,7 @@ void setup() {
   lastSensorMs = 0;
   lastDisplayMs = 0;
   lastStatusMs = 0;
+  lastReportMs = 0;
   Serial.println("[CHG] Setup complete");
 }
 
@@ -394,5 +561,10 @@ void loop() {
   if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
     printStatus();
+  }
+
+  if (now - lastReportMs >= REPORT_INTERVAL_MS) {
+    lastReportMs = now;
+    sendChargingDockStatus();
   }
 }

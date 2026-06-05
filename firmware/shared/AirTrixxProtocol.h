@@ -34,7 +34,8 @@ enum AirTrixxMessageType : uint8_t {
   MSG_KEYBOARD_TOF   = 11,
   MSG_AUDIODOCK_DATA = 12,
   MSG_AUDIODOCK_AUDIO_CHUNK = 13,
-  MSG_AUDIODOCK_TRANSCRIPT = 14
+  MSG_AUDIODOCK_TRANSCRIPT = 14,
+  MSG_CHARGING_DOCK_STATUS = 15
 };
 
 static const uint8_t AIRTRIXX_OTA_SSID_MAX = 32;
@@ -42,6 +43,7 @@ static const uint8_t AIRTRIXX_OTA_PASSWORD_MAX = 64;
 static const uint8_t AIRTRIXX_OTA_URL_MAX = 96;
 static const uint8_t AIRTRIXX_OTA_MD5_MAX = 32;
 static const uint8_t AIRTRIXX_OTA_CHUNK_BYTES = 32;
+static const uint8_t AIRTRIXX_CHARGING_DOCK_CHANNELS = 4;
 
 enum AirTrixxOtaChunkField : uint8_t {
   OTA_FIELD_RESET    = 0,
@@ -162,6 +164,23 @@ struct AIRTRIXX_PACKED KeyboardTofPacket {
   uint8_t valid_2;
   uint8_t valid_3;
   uint8_t valid_4;
+};
+
+struct AIRTRIXX_PACKED ChargingDockStatusPacket {
+  AirTrixxPacketHeader header;
+  uint8_t active_tab;
+  int8_t priority_channel;
+  uint8_t ina_valid_mask;
+  uint8_t battery_present_mask;
+  uint8_t charging_mask;
+  uint8_t full_mask;
+  uint8_t hot_mask;
+  uint8_t temp_valid_mask;
+  uint8_t battery_percent[AIRTRIXX_CHARGING_DOCK_CHANNELS];
+  uint16_t battery_mv[AIRTRIXX_CHARGING_DOCK_CHANNELS];
+  int16_t current_ma[AIRTRIXX_CHARGING_DOCK_CHANNELS];
+  int16_t temp_centi_c[AIRTRIXX_CHARGING_DOCK_CHANNELS];
+  uint16_t energy_mah[AIRTRIXX_CHARGING_DOCK_CHANNELS];
 };
 
 struct AIRTRIXX_PACKED AudioDockDataPacket {

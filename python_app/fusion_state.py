@@ -796,6 +796,7 @@ class FusionState:
         wrist = devices.get("wristband", {}) if isinstance(devices, dict) else {}
         camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
         keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
+        charging_dock = devices.get("charging_dock", {}) if isinstance(devices, dict) else {}
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         tof = camdock.get("tof", {}) if isinstance(camdock, dict) else {}
         keyboard_tof = keyboard.get("tof", {}) if isinstance(keyboard, dict) else {}
@@ -831,7 +832,7 @@ class FusionState:
             "keyboard_sensor_2_mm": keyboard_tof.get("sensor_2_mm") if isinstance(keyboard_tof, dict) else None,
             "keyboard_sensor_3_mm": keyboard_tof.get("sensor_3_mm") if isinstance(keyboard_tof, dict) else None,
             "keyboard_sensor_4_mm": keyboard_tof.get("sensor_4_mm") if isinstance(keyboard_tof, dict) else None,
-            "charging_dock_input": "TBD",
+            "charging_dock_input": charging_dock.get("input") if isinstance(charging_dock, dict) else None,
             "audiodock_input": "TBD",
             "fans_input": fans.get("input") if isinstance(fans, dict) else None,
         }
