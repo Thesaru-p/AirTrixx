@@ -1656,6 +1656,13 @@ class AirTrixxGUI:
         self.audio_connect_button = ttk.Button(controls, text="Connect", command=self.toggle_audio_dock, style="Accent.TButton")
         self.audio_connect_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
 
+        ttk.Button(controls, text="LED Test", command=self.audio_dock_led_test, style="Secondary.TButton").grid(
+            row=1, column=2, sticky="e", padx=(8, 0), pady=(8, 0)
+        )
+        ttk.Button(controls, text="Speaker Test", command=self.audio_dock_speaker_test, style="Secondary.TButton").grid(
+            row=1, column=3, sticky="e", padx=(8, 0), pady=(8, 0)
+        )
+
         # Status displays
         status_box = ttk.LabelFrame(body, text="Status & Readings", padding=10)
         status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -1695,6 +1702,12 @@ class AirTrixxGUI:
             self.audio_connect_button.configure(text="Disconnect")
         else:
             self.log("Failed to connect to Audio Dock.")
+
+    def audio_dock_led_test(self) -> None:
+        self.audio_dock_bridge.send_control("led_test")
+
+    def audio_dock_speaker_test(self) -> None:
+        self.audio_dock_bridge.send_control("speaker_test")
 
     def _refresh_audio_ports(self) -> None:
         ports = self.serial_bridge.available_ports()
