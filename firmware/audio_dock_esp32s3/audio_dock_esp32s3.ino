@@ -63,7 +63,7 @@ static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 #define SD_SCK_PIN 38
 #define SD_MISO_PIN 40
 #define SD_MOSI_PIN 39
-#define SD_SPI_HZ 20000000
+#define SD_SPI_HZ 4000000
 static const char *AUDIO_WAV_PATH = "/AIRDCK.WAV";
 
 // -------------------- MAX98357A I2S speaker --------------------
@@ -122,6 +122,7 @@ void ringShowReady();
 void ringShowSuccess();
 void ringShowError();
 void runLedRingSelfTest();
+void disableOnboardLed();
 void playTranscriptionDoneSound();
 void runSpeakerSelfTest();
 
@@ -226,6 +227,17 @@ void runLedRingSelfTest() {
   Serial.println("LED_RING_TEST_DONE");
 }
 
+void disableOnboardLed() {
+#if defined(RGB_BUILTIN)
+  neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+  pinMode(RGB_BUILTIN, OUTPUT);
+  digitalWrite(RGB_BUILTIN, LOW);
+#elif defined(LED_BUILTIN)
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+#endif
+}
+
 // -------------------- MAX98357A Speaker Helper Functions --------------------
 bool initSpeakerI2S() {
   if (speakerReady) {
@@ -273,6 +285,18 @@ bool initSpeakerI2S() {
                 SPEAKER_LRC_PIN,
                 SPEAKER_DIN_PIN);
   return true;
+}
+
+void deinitSpeakerI2S() {
+  if (!speakerReady) {
+    disableOnboardLed();
+    return;
+  }
+
+  i2s_zero_dma_buffer(SPEAKER_I2S_PORT);
+  i2s_driver_uninstall(SPEAKER_I2S_PORT);
+  speakerReady = false;
+  disableOnboardLed();
 }
 
 void playSpeakerSilence(uint16_t durationMs) {
@@ -336,6 +360,7 @@ void playTranscriptionDoneSound() {
   playSpeakerSilence(50);
   playSpeakerTone(1175, 180);
   playSpeakerSilence(30);
+  deinitSpeakerI2S();
 }
 
 void runSpeakerSelfTest() {
@@ -456,7 +481,24 @@ bool allocateAudioBuffer() {
 }
 
 bool initSDCard() {
+  if (sdReady) {
+    SD.end();
+    SPI.end();
+    sdReady = false;
+    delay(20);
+  }
+
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  delay(10);
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  Serial.printf("SD init begin: CS=%u SCK=%u MISO=%u MOSI=%u hz=%u\n",
+                SD_CS_PIN,
+                SD_SCK_PIN,
+                SD_MISO_PIN,
+                SD_MOSI_PIN,
+                SD_SPI_HZ);
+
   if (!SD.begin(SD_CS_PIN, SPI, SD_SPI_HZ)) {
     Serial.println("SD init failed. Check CS/SCK/MISO/MOSI pins and card format.");
     sdReady = false;
@@ -550,7 +592,7 @@ bool recordWavToMemory(uint32_t *wavBytes) {
 
 bool recordWavToSD(uint32_t *wavBytes) {
   lastRecordError = "";
-  if (!sdReady && !initSDCard()) {
+  if (!initSDCard()) {
     lastRecordError = "SD not ready";
     return false;
   }
@@ -1153,7 +1195,7 @@ void setup() {
   ledRing.setBrightness(LED_RING_BRIGHTNESS);
   ringClear();
   ringShowReady();
-  initSpeakerI2S();
+  disableOnboardLed();
 
   // Initialize LCD Screen
   Wire.begin(I2C_SDA, I2C_SCL);
