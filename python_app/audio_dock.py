@@ -95,6 +95,28 @@ class AudioDockBridge:
         self._set_status("Disconnected")
         self._log("Disconnected.")
 
+    def send_control(self, control: str) -> bool:
+        if not self.serial_bridge or not self.serial_bridge.is_connected:
+            self._log("Error: Antenna is not connected.")
+            return False
+
+        normalized = control.strip().lower()
+        if normalized not in {"led_test", "speaker_test"}:
+            self._log(f"Unsupported control: {control}")
+            return False
+
+        command = {
+            "cmd": "audiodock",
+            "control": normalized,
+        }
+        if self.serial_bridge.send_command(command):
+            label = "LED ring test" if normalized == "led_test" else "speaker test"
+            self._log(f"Sent wireless {label} command.")
+            return True
+
+        self._log("Failed to send Audio Dock control command to Antenna.")
+        return False
+
     def handle_antenna_line(self, line: str) -> None:
         if not self.is_connected:
             return

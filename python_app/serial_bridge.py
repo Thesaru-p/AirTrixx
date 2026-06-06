@@ -243,6 +243,20 @@ class SerialBridge:
                 self._log(f"[Antenna] {line}")
                 continue
 
+            looks_like_direct_audio_dock = (
+                line.startswith("CLAP_SCORES") or
+                line.startswith("Triggered!") or
+                line.startswith("RECORD_STREAM_") or
+                line.startswith("Audio RAM ") or
+                line.startswith("AUDIO_DOCK_MAC:")
+            )
+            if looks_like_direct_audio_dock:
+                self._log(
+                    "Audio Dock debug output detected on the active serial port. "
+                    "Connect the app to the Antenna ESP32-S3 COM port; the Audio Dock should talk wirelessly."
+                )
+                continue
+
             is_audiodock = (
                 "AUDIODOCK_" in line or 
                 "UDIODOCK_" in line or 
