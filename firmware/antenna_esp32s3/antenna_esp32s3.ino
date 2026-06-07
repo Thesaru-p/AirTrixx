@@ -153,29 +153,37 @@ void updateAntennaStatusLed(uint32_t nowMs) {
   lastAntennaLedUpdateMs = nowMs;
 
   uint8_t connected = connectedDeviceCount(nowMs);
-  uint8_t state = connected;
-  if (state > 3 && state < ANTENNA_TOTAL_TRACKED_DEVICES) {
-    state = 3;
-  }
-  if (connected >= ANTENNA_TOTAL_TRACKED_DEVICES) {
-    state = ANTENNA_TOTAL_TRACKED_DEVICES;
+  if (connected > ANTENNA_TOTAL_TRACKED_DEVICES) {
+    connected = ANTENNA_TOTAL_TRACKED_DEVICES;
   }
 
-  if (state == lastAntennaLedState) {
+  if (connected == lastAntennaLedState) {
     return;
   }
-  lastAntennaLedState = state;
+  lastAntennaLedState = connected;
 
-  if (state == 0) {
-    setAntennaStatusLed(32, 0, 0);        // red: none connected
-  } else if (state == 1) {
-    setAntennaStatusLed(24, 24, 24);      // white: one connected
-  } else if (state == 2) {
-    setAntennaStatusLed(32, 24, 0);       // yellow: two connected
-  } else if (state == ANTENNA_TOTAL_TRACKED_DEVICES) {
-    setAntennaStatusLed(0, 32, 0);        // green: all connected
-  } else {
-    setAntennaStatusLed(0, 0, 40);        // blue: three or more connected
+  switch (connected) {
+    case 0:
+      setAntennaStatusLed(32, 0, 0);      // red
+      break;
+    case 1:
+      setAntennaStatusLed(24, 24, 24);    // white
+      break;
+    case 2:
+      setAntennaStatusLed(32, 24, 0);     // yellow
+      break;
+    case 3:
+      setAntennaStatusLed(0, 28, 48);     // ocean blue
+      break;
+    case 4:
+      setAntennaStatusLed(48, 0, 20);     // pink
+      break;
+    case 5:
+      setAntennaStatusLed(28, 0, 48);     // purple
+      break;
+    default:
+      setAntennaStatusLed(0, 32, 0);      // green
+      break;
   }
 }
 
