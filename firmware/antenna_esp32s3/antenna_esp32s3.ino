@@ -232,9 +232,11 @@ bool extractUInt16Field(const String &json, const char *key, uint16_t &out) {
   return true;
 }
 
-template <size_t N>
-void copyStringToPacketField(char (&field)[N], const String &value) {
-  size_t len = min(static_cast<size_t>(value.length()), N - 1);
+void copyStringToPacketField(char *field, size_t fieldSize, const String &value) {
+  if (field == nullptr || fieldSize == 0) {
+    return;
+  }
+  size_t len = min(static_cast<size_t>(value.length()), fieldSize - 1);
   memcpy(field, value.c_str(), len);
   field[len] = '\0';
 }
@@ -370,10 +372,10 @@ void handleOtaJsonCommand(const String &line) {
              ++otaCommandSequence,
              millis(),
              false);
-  copyStringToPacketField(packet.ssid, ssid);
-  copyStringToPacketField(packet.password, password);
-  copyStringToPacketField(packet.url, url);
-  copyStringToPacketField(packet.md5, md5);
+  copyStringToPacketField(packet.ssid, sizeof(packet.ssid), ssid);
+  copyStringToPacketField(packet.password, sizeof(packet.password), password);
+  copyStringToPacketField(packet.url, sizeof(packet.url), url);
+  copyStringToPacketField(packet.md5, sizeof(packet.md5), md5);
   if (targetWristband) {
     sendOtaStartToTarget(packet, WRISTBAND_MAC_PLACEHOLDER, "wristband");
   } else if (targetCamDock) {
@@ -407,6 +409,8 @@ void handleFanJsonCommand(const String &line) {
   sendFanCommandToFans(packet);
 }
 
+bool sendAudioDockTextPacket(const String &text, const char *statusPrefix, const String &statusValue = "");
+
 void handleSerialJsonCommand(const String &line) {
   String cmd;
   if (!extractStringField(line, "cmd", cmd)) {
@@ -422,22 +426,31 @@ void handleSerialJsonCommand(const String &line) {
     return;
   }
   if (cmd == "audiodock") {
+    String control;
+    bool hasControl = extractStringField(line, "control", control) ||
+                      extractStringField(line, "action", control);
+    if (hasControl) {
+      control.trim();
+      control.toLowerCase();
+
+      String commandText;
+      if (control == "ledtest" || control == "led_test" || control == "led") {
+        commandText = "__CMD:LEDTEST__";
+      } else if (control == "speakertest" || control == "speaker_test" ||
+                 control == "speaker" || control == "spktest") {
+        commandText = "__CMD:SPEAKERTEST__";
+      } else {
+        debugPrintln("Unsupported audiodock control: " + control);
+        return;
+      }
+
+      sendAudioDockTextPacket(commandText, "ANTENNA_AUDIODOCK_CONTROL:", control);
+      return;
+    }
+
     String transcript;
     if (extractStringField(line, "transcript", transcript)) {
-      AudioDockTranscriptPacket packet = {};
-      fillHeader(packet.header,
-                 MSG_AUDIODOCK_TRANSCRIPT,
-                 DEVICE_ANTENNA,
-                 ++antennaJsonSequence,
-                 millis(),
-                 false);
-      copyStringToPacketField(packet.transcript, transcript);
-      esp_err_t result = esp_now_send(AUDIODOCK_MAC_PLACEHOLDER,
-                                      reinterpret_cast<const uint8_t *>(&packet),
-                                      sizeof(packet));
-      if (result != ESP_OK) {
-        debugPrintln("ESP-NOW audiodock transcript send failed: " + String(result));
-      }
+      sendAudioDockTextPacket(transcript, "ANTENNA_AUDIODOCK_TRANSCRIPT:");
     }
     return;
   }
@@ -531,6 +544,45 @@ void pumpSerialCommands() {
     }
     xSemaphoreGive(serialMutex);
   }
+}
+
+bool sendAudioDockTextPacket(const String &text, const char *statusPrefix, const String &statusValue) {
+  uint8_t okCount = 0;
+  esp_err_t lastResult = ESP_FAIL;
+
+  for (uint8_t attempt = 0; attempt < 8; attempt++) {
+    AudioDockTranscriptPacket packet = {};
+    fillHeader(packet.header,
+               MSG_AUDIODOCK_TRANSCRIPT,
+               DEVICE_ANTENNA,
+               ++antennaJsonSequence,
+               millis(),
+               false);
+    copyStringToPacketField(packet.transcript, sizeof(packet.transcript), text);
+    lastResult = esp_now_send(ESPNOW_BROADCAST_MAC,
+                              reinterpret_cast<const uint8_t *>(&packet),
+                              sizeof(packet));
+    if (lastResult == ESP_OK) {
+      okCount++;
+    }
+    delay(35);
+  }
+
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.print(statusPrefix);
+    if (statusValue.length() > 0) {
+      Serial.print(statusValue);
+      Serial.print(",");
+    }
+    Serial.print(okCount > 0 ? "sent" : "failed");
+    Serial.print(",ok=");
+    Serial.print(okCount);
+    Serial.print(",last=");
+    Serial.println(lastResult);
+    xSemaphoreGive(serialMutex);
+  }
+
+  return okCount > 0;
 }
 
 void handleIncomingPacket(const uint8_t *data, int len) {
