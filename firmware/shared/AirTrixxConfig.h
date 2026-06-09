@@ -42,7 +42,7 @@ static const uint8_t CH_LEFT_TOF  = 2;
 static const uint8_t CH_RIGHT_TOF = 1;
 
 // Keyboard battery divider: GND -> 22k -> ADC pin -> 22k -> LiPo positive.
-static const int KEYBOARD_BATTERY_ADC_PIN = 36;
+static const int KEYBOARD_BATTERY_ADC_PIN = 4;
 static const float KEYBOARD_BATTERY_DIVIDER_RATIO = 2.0f;
 static const float KEYBOARD_BATTERY_EMPTY_V = 3.30f;
 static const float KEYBOARD_BATTERY_FULL_V = 4.20f;
