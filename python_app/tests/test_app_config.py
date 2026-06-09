@@ -18,6 +18,13 @@ from config import DEFAULT_CALIBRATION, load_calibration_with_warnings, save_cal
 class FakeConnectedSerialBridge:
     is_connected = True
 
+    def __init__(self) -> None:
+        self.commands: list[dict] = []
+
+    def send_command(self, command: dict) -> bool:
+        self.commands.append(command)
+        return True
+
 
 class AppPathTests(unittest.TestCase):
     def test_windows_user_data_uses_appdata(self) -> None:
@@ -41,6 +48,7 @@ class AppPathTests(unittest.TestCase):
         self.assertEqual(paths.audio_recording_path, paths.temp_dir / "last_esp32_recording.wav")
         self.assertEqual(paths.gesture_data_dir, paths.user_data_dir / "gestures")
         self.assertEqual(paths.keyboard_data_dir, paths.user_data_dir / "keyboard")
+        self.assertEqual(paths.audio_training_dir, paths.user_data_dir / "audio_training")
         self.assertEqual(paths.keyboard_dataset_path, paths.keyboard_data_dir / "raw_samples.csv")
         self.assertEqual(paths.keyboard_model_path, paths.keyboard_data_dir / "word_knn_model.npz")
         self.assertEqual(paths.keyboard_words_path, paths.keyboard_data_dir / "current_training_words.txt")
@@ -87,6 +95,40 @@ class AudioDockSettingsTests(unittest.TestCase):
         self.assertTrue(bridge.is_connected)
         self.assertEqual(bridge.status, "Waiting for Clap")
         self.assertTrue(any("transcription needs a key" in message for message in logs))
+
+    def test_audio_dock_saves_labeled_training_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            samples: list[tuple[str, Path]] = []
+            bridge = AudioDockBridge(training_data_dir=Path(tmpdir))
+            bridge.on_training_sample = lambda label, path: samples.append((label, path))
+            bridge.last_audio_data = b"RIFFfakewav"
+            bridge.last_trigger = "Double clap"
+
+            saved = bridge.save_last_training_sample("false trigger")
+
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertEqual(saved.parent, Path(tmpdir) / "false_trigger")
+            self.assertEqual(saved.read_bytes(), b"RIFFfakewav")
+            self.assertEqual(samples, [("false_trigger", saved)])
+
+    def test_audio_dock_sends_training_record_control(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        bridge = AudioDockBridge(serial_bridge=serial_bridge)
+        bridge.is_connected = True
+
+        self.assertTrue(bridge.send_control("training_record"))
+
+        self.assertEqual(serial_bridge.commands, [{"cmd": "audiodock", "control": "training_record"}])
+
+    def test_audio_dock_sends_training_record_count(self) -> None:
+        serial_bridge = FakeConnectedSerialBridge()
+        bridge = AudioDockBridge(serial_bridge=serial_bridge)
+        bridge.is_connected = True
+
+        self.assertTrue(bridge.send_control("training_record", count=10))
+
+        self.assertEqual(serial_bridge.commands, [{"cmd": "audiodock", "control": "training_record", "count": 10}])
 
 
 if __name__ == "__main__":

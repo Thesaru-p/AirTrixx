@@ -23,6 +23,7 @@ TEMP_DIR = PATHS.temp_dir
 EXPORTS_DIR = PATHS.exports_dir
 GESTURE_DATA_DIR = PATHS.gesture_data_dir
 KEYBOARD_DATA_DIR = PATHS.keyboard_data_dir
+AUDIO_TRAINING_DIR = PATHS.audio_training_dir
 CALIBRATION_PATH = PATHS.calibration_path
 MAPPING_PATH = PATHS.mapping_path
 SERVO_DEBUG_LOG_PATH = PATHS.servo_debug_log_path
@@ -129,6 +130,7 @@ class AppConfig:
     mapping_path: Path = MAPPING_PATH
     gesture_data_dir: Path = GESTURE_DATA_DIR
     keyboard_data_dir: Path = KEYBOARD_DATA_DIR
+    audio_training_dir: Path = AUDIO_TRAINING_DIR
     servo_debug_log_path: Path = SERVO_DEBUG_LOG_PATH
     audio_recording_path: Path = AUDIO_RECORDING_PATH
     keyboard_dataset_path: Path = KEYBOARD_DATASET_PATH
@@ -236,6 +238,7 @@ def load_app_config() -> AppConfig:
         mapping_path=PATHS.mapping_path,
         gesture_data_dir=PATHS.gesture_data_dir,
         keyboard_data_dir=PATHS.keyboard_data_dir,
+        audio_training_dir=PATHS.audio_training_dir,
         servo_debug_log_path=PATHS.servo_debug_log_path,
         audio_recording_path=PATHS.audio_recording_path,
         keyboard_dataset_path=PATHS.keyboard_dataset_path,

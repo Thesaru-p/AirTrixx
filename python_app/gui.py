@@ -41,7 +41,7 @@ from keyboard_bridge import KeyboardBridge
 from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
-from audio_dock import AudioDockBridge
+from audio_dock import AudioDockBridge, TRAINING_LABELS
 
 
 SERVO_BRACKETS = {
@@ -338,12 +338,20 @@ class AirTrixxGUI:
         self.audio_dock_last_trigger_var = tk.StringVar(value="-")
         self.audio_dock_latest_transcript_var = tk.StringVar(value="-")
         self.audio_dock_port_var = tk.StringVar()
+        self.audio_training_mode_var = tk.BooleanVar(value=False)
+        self.audio_training_label_var = tk.StringVar(value=TRAINING_LABELS[0])
+        self.audio_training_count_var = tk.StringVar(value="10")
+        self.audio_training_status_var = tk.StringVar(value="Training: idle")
+        self.audio_training_sample_count_var = tk.StringVar(value="Saved clips: 0")
         self.audio_dock_bridge = AudioDockBridge(
             on_log=self._on_audio_dock_log,
             on_status=self._on_audio_dock_status,
             on_transcript=self._on_audio_dock_transcript,
+            on_training=self._on_audio_dock_training,
+            on_training_sample=self._on_audio_dock_training_sample,
             deepgram_api_key=str(self.config.calibration.get("deepgram_api_key", "")),
             audio_recording_path=self.config.audio_recording_path,
+            training_data_dir=self.config.audio_training_dir,
         )
         self.audio_dock_bridge.serial_bridge = self.serial_bridge
         self.serial_bridge.audio_dock_bridge = self.audio_dock_bridge
@@ -2064,9 +2072,83 @@ class AirTrixxGUI:
         ttk.Label(status_box, text="Latest Transcription:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Label(status_box, textvariable=self.audio_dock_latest_transcript_var, font=("Segoe UI Semibold", 10)).grid(row=2, column=1, sticky="w", pady=4, padx=8)
 
+        training_box = ttk.LabelFrame(body, text="Training Samples", padding=10)
+        training_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        training_box.columnconfigure(2, weight=1)
+        training_box.columnconfigure(6, weight=1)
+        training_box.rowconfigure(3, weight=1)
+
+        ttk.Checkbutton(training_box, text="Training mode", variable=self.audio_training_mode_var).grid(
+            row=0, column=0, sticky="w", pady=4, padx=(0, 10)
+        )
+        ttk.Label(training_box, text="Label").grid(row=0, column=1, sticky="e", pady=4, padx=(0, 6))
+        self.audio_training_label_combo = ttk.Combobox(
+            training_box,
+            textvariable=self.audio_training_label_var,
+            values=TRAINING_LABELS,
+            state="readonly",
+            width=18,
+        )
+        self.audio_training_label_combo.grid(row=0, column=2, sticky="w", pady=4)
+
+        ttk.Label(training_box, text="Count").grid(row=0, column=3, sticky="e", pady=4, padx=(8, 4))
+        ttk.Spinbox(
+            training_box,
+            from_=1,
+            to=100,
+            width=6,
+            textvariable=self.audio_training_count_var,
+        ).grid(row=0, column=4, sticky="w", pady=4)
+
+        ttk.Button(training_box, text="Start Capture", command=self.audio_dock_start_training_capture, style="Accent.TButton").grid(
+            row=0, column=5, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Arm Clap Capture", command=self.audio_dock_auto_capture_samples, style="Secondary.TButton").grid(
+            row=0, column=6, sticky="w", padx=(8, 0), pady=4
+        )
+
+        ttk.Button(training_box, text="Save Last", command=self.audio_dock_save_last_sample, style="Secondary.TButton").grid(
+            row=1, column=4, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Stop", command=self.audio_dock_stop_training_capture, style="Secondary.TButton").grid(
+            row=1, column=5, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Open Folder", command=self.audio_dock_open_training_folder, style="Secondary.TButton").grid(
+            row=1, column=6, sticky="w", padx=(8, 0), pady=4
+        )
+        ttk.Label(training_box, textvariable=self.audio_training_status_var, font=("Segoe UI Semibold", 10)).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(training_box, textvariable=self.audio_training_sample_count_var).grid(
+            row=1, column=3, sticky="w", padx=(8, 0), pady=4
+        )
+
+        sample_list = ttk.Frame(training_box)
+        sample_list.grid(row=3, column=0, columnspan=7, sticky="nsew", pady=(8, 0))
+        sample_list.columnconfigure(0, weight=1)
+        sample_list.rowconfigure(0, weight=1)
+        self.audio_training_tree = ttk.Treeview(
+            sample_list,
+            columns=("label", "file", "time"),
+            show="headings",
+            height=5,
+            selectmode="browse",
+        )
+        self.audio_training_tree.heading("label", text="Label")
+        self.audio_training_tree.heading("file", text="File")
+        self.audio_training_tree.heading("time", text="Saved")
+        self.audio_training_tree.column("label", width=120, anchor="w", stretch=False)
+        self.audio_training_tree.column("file", width=440, anchor="w")
+        self.audio_training_tree.column("time", width=90, anchor="w", stretch=False)
+        self.audio_training_tree.grid(row=0, column=0, sticky="nsew")
+        sample_scroll = ttk.Scrollbar(sample_list, orient="vertical", command=self.audio_training_tree.yview)
+        sample_scroll.grid(row=0, column=1, sticky="ns")
+        self.audio_training_tree.configure(yscrollcommand=sample_scroll.set)
+        self._refresh_audio_training_samples()
+
         # Log box
         log_box = ttk.LabelFrame(body, text="Audio Dock Console Log", padding=10)
-        log_box.grid(row=2, column=0, sticky="nsew")
+        log_box.grid(row=3, column=0, sticky="nsew")
         log_box.rowconfigure(0, weight=1)
         log_box.columnconfigure(0, weight=1)
 
@@ -2115,6 +2197,78 @@ class AirTrixxGUI:
     def audio_dock_speaker_test(self) -> None:
         self.audio_dock_bridge.send_control("speaker_test")
 
+    def _audio_training_count(self) -> int:
+        try:
+            return max(1, min(100, int(self.audio_training_count_var.get())))
+        except (TypeError, ValueError):
+            self.audio_training_count_var.set("10")
+            return 10
+
+    def audio_dock_start_training_capture(self) -> None:
+        self.audio_training_mode_var.set(True)
+        if not self.audio_dock_bridge.is_connected:
+            if not self.audio_dock_bridge.connect(None):
+                self.audio_training_status_var.set("Connect Antenna first")
+                self._sync_audio_dock_controls()
+                return
+            self._sync_audio_dock_controls()
+
+        capture_count = self._audio_training_count()
+        self.audio_dock_bridge.arm_training_capture(self.audio_training_label_var.get(), capture_count)
+        if not self.audio_dock_bridge.send_control("training_record", count=capture_count):
+            self.audio_dock_bridge.cancel_training_capture()
+            self.audio_training_status_var.set("Start capture failed")
+            return
+        self.audio_training_status_var.set(f"Batch recording {self.audio_training_label_var.get()} x{capture_count}...")
+
+    def audio_dock_auto_capture_samples(self) -> None:
+        self.audio_training_mode_var.set(True)
+        self.audio_dock_bridge.arm_training_capture(self.audio_training_label_var.get(), self._audio_training_count())
+
+    def audio_dock_stop_training_capture(self) -> None:
+        self.audio_training_mode_var.set(False)
+        self.audio_dock_bridge.cancel_training_capture()
+
+    def audio_dock_save_last_sample(self) -> None:
+        self.audio_dock_bridge.save_last_training_sample(self.audio_training_label_var.get())
+
+    def audio_dock_open_training_folder(self) -> None:
+        path = self.config.audio_training_dir
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif os.name == "nt":
+                subprocess.Popen(["explorer", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.log(f"Opened Audio Dock training folder: {path}")
+        except Exception as exc:
+            self.log(f"Failed to open Audio Dock training folder: {exc}")
+
+    def _refresh_audio_training_samples(self) -> None:
+        if not hasattr(self, "audio_training_tree") or not self.audio_training_tree.winfo_exists():
+            return
+
+        root = self.config.audio_training_dir
+        root.mkdir(parents=True, exist_ok=True)
+        samples: list[Path] = []
+        for sample in root.rglob("*.wav"):
+            if sample.is_file():
+                samples.append(sample)
+
+        samples.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        self.audio_training_tree.delete(*self.audio_training_tree.get_children())
+        for sample in samples[:50]:
+            try:
+                saved_time = time.strftime("%H:%M:%S", time.localtime(sample.stat().st_mtime))
+                display_name = str(sample.relative_to(root))
+            except OSError:
+                saved_time = "-"
+                display_name = sample.name
+            self.audio_training_tree.insert("", "end", values=(sample.parent.name, display_name, saved_time))
+        self.audio_training_sample_count_var.set(f"Saved clips: {len(samples)}")
+
     def _refresh_audio_ports(self) -> None:
         ports = self.serial_bridge.available_ports()
         ports = sorted(ports, key=self._serial_port_sort_key)
@@ -2152,6 +2306,21 @@ class AirTrixxGUI:
         self.audio_dock_status_var.set(status)
         self._sync_audio_dock_controls()
         self._schedule_text_update()
+
+    def _on_audio_dock_training(self, status: str) -> None:
+        try:
+            self.root.after(0, lambda value=status: self.audio_training_status_var.set(value))
+        except tk.TclError:
+            pass
+
+    def _on_audio_dock_training_sample(self, label: str, path: Path) -> None:
+        try:
+            self.root.after(0, self._after_audio_training_sample_saved)
+        except tk.TclError:
+            pass
+
+    def _after_audio_training_sample_saved(self) -> None:
+        self._refresh_audio_training_samples()
 
     def _on_audio_dock_transcript(self, trigger: str, text: str) -> None:
         try:

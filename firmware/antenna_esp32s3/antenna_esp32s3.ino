@@ -65,7 +65,47 @@ struct AIRTRIXX_PACKED LegacyFanStatusPacket {
   uint16_t last_command_sequence;
 };
 
+struct WristbandMotionValues {
+  float accelMps2X = 0.0f;
+  float accelMps2Y = 0.0f;
+  float accelMps2Z = 0.0f;
+  float gyroDpsX = 0.0f;
+  float gyroDpsY = 0.0f;
+  float gyroDpsZ = 0.0f;
+  float pitchDeg = 0.0f;
+  float rollDeg = 0.0f;
+};
+
+struct WristbandCalibrationState {
+  float yawDeg = 0.0f;
+  uint32_t lastOrientMs = 0;
+  bool haveOrient = false;
+
+  bool calibrating = false;
+  uint32_t calibrateStartMs = 0;
+  double sumPitch = 0.0;
+  double sumRoll = 0.0;
+  double sumYaw = 0.0;
+  double sumAccelX = 0.0;
+  double sumAccelY = 0.0;
+  double sumAccelZ = 0.0;
+  uint16_t calibrateCount = 0;
+  bool calibrationSkipped = false;
+
+  bool calibrated = false;
+  float pitchOffsetDeg = 0.0f;
+  float rollOffsetDeg = 0.0f;
+  float yawOffsetDeg = 0.0f;
+  float accelOffsetMps2X = 0.0f;
+  float accelOffsetMps2Y = 0.0f;
+  float accelOffsetMps2Z = 0.0f;
+
+  bool autoCalibratePending = true;
+  bool wristWasConnected = false;
+};
+
 static LatestWristband latestWristband;
+static WristbandCalibrationState wristCalState;
 static LatestBatteryStatus latestWristbandBattery;
 static LatestBatteryStatus latestKeyboardBattery;
 static LatestBatteryStatus latestAudioDockBattery;
@@ -97,6 +137,157 @@ static size_t serialLineLen = 0;
 static const uint32_t BATTERY_STATUS_STALE_MS = 11UL * 60UL * 1000UL;
 static const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
+static const uint32_t WRISTBAND_CALIBRATION_MS = 2000;
+static const uint16_t WRISTBAND_CALIBRATION_MIN_SAMPLES = 20;
+
+float angleDelta(float current, float anchor) {
+  return fmodf(current - anchor + 540.0f, 360.0f) - 180.0f;
+}
+
+void wristbandPacketToValues(const WristbandDataPacket &packet, WristbandMotionValues &out) {
+  out.accelMps2X = packet.accel_mg_x * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.accelMps2Y = packet.accel_mg_y * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.accelMps2Z = packet.accel_mg_z * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.gyroDpsX = packet.gyro_mdps_x * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.gyroDpsY = packet.gyro_mdps_y * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.gyroDpsZ = packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.pitchDeg = packet.pitch_cdeg * AIRTRIXX_CDEG_TO_DEG;
+  out.rollDeg = packet.roll_cdeg * AIRTRIXX_CDEG_TO_DEG;
+}
+
+void logWristbandCalibrationLine(const String &message) {
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.println(message);
+    xSemaphoreGive(serialMutex);
+  }
+}
+
+void updateWristbandYaw(const WristbandDataPacket &packet) {
+  if (wristCalState.haveOrient) {
+    uint32_t packetMs = packet.header.t_ms;
+    uint32_t dtMs = packetMs - wristCalState.lastOrientMs;
+    if (packetMs < wristCalState.lastOrientMs) {
+      dtMs = 0;
+    } else if (dtMs > 100) {
+      dtMs = 100;
+    }
+    if (dtMs > 0) {
+      float gyroZDps = packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
+      wristCalState.yawDeg += gyroZDps * (static_cast<float>(dtMs) / 1000.0f);
+    }
+  }
+  wristCalState.lastOrientMs = packet.header.t_ms;
+  wristCalState.haveOrient = true;
+}
+
+void beginWristbandCalibration() {
+  portENTER_CRITICAL(&stateMux);
+  wristCalState.calibrating = true;
+  wristCalState.calibrateStartMs = millis();
+  wristCalState.sumPitch = 0.0;
+  wristCalState.sumRoll = 0.0;
+  wristCalState.sumYaw = 0.0;
+  wristCalState.sumAccelX = 0.0;
+  wristCalState.sumAccelY = 0.0;
+  wristCalState.sumAccelZ = 0.0;
+  wristCalState.calibrateCount = 0;
+  wristCalState.calibrationSkipped = false;
+  portEXIT_CRITICAL(&stateMux);
+  logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:started");
+}
+
+void feedWristbandCalibrationSample(const WristbandDataPacket &packet) {
+  if (!wristCalState.calibrating) {
+    return;
+  }
+
+  WristbandMotionValues values = {};
+  wristbandPacketToValues(packet, values);
+  wristCalState.sumPitch += values.pitchDeg;
+  wristCalState.sumRoll += values.rollDeg;
+  wristCalState.sumYaw += wristCalState.yawDeg;
+  wristCalState.sumAccelX += values.accelMps2X;
+  wristCalState.sumAccelY += values.accelMps2Y;
+  wristCalState.sumAccelZ += values.accelMps2Z;
+  wristCalState.calibrateCount++;
+}
+
+void finalizeWristbandCalibration() {
+  portENTER_CRITICAL(&stateMux);
+  if (!wristCalState.calibrating) {
+    portEXIT_CRITICAL(&stateMux);
+    return;
+  }
+
+  uint16_t count = wristCalState.calibrateCount;
+  wristCalState.calibrating = false;
+  if (count < WRISTBAND_CALIBRATION_MIN_SAMPLES) {
+    wristCalState.calibrationSkipped = true;
+    portEXIT_CRITICAL(&stateMux);
+    logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:skipped,no_samples");
+    return;
+  }
+
+  float invCount = 1.0f / static_cast<float>(count);
+  wristCalState.pitchOffsetDeg = static_cast<float>(wristCalState.sumPitch * invCount);
+  wristCalState.rollOffsetDeg = static_cast<float>(wristCalState.sumRoll * invCount);
+  wristCalState.yawOffsetDeg = static_cast<float>(wristCalState.sumYaw * invCount);
+  wristCalState.accelOffsetMps2X = static_cast<float>(wristCalState.sumAccelX * invCount);
+  wristCalState.accelOffsetMps2Y = static_cast<float>(wristCalState.sumAccelY * invCount);
+  wristCalState.accelOffsetMps2Z = static_cast<float>(wristCalState.sumAccelZ * invCount);
+  wristCalState.calibrated = true;
+  wristCalState.calibrationSkipped = false;
+  wristCalState.autoCalibratePending = false;
+  portEXIT_CRITICAL(&stateMux);
+
+  logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:complete,samples=" + String(count));
+}
+
+const char *wristbandCalibrationStatusText(const WristbandCalibrationState &state) {
+  if (state.calibrating) {
+    return "calibrating";
+  }
+  if (state.calibrated) {
+    return "ok";
+  }
+  if (state.calibrationSkipped) {
+    return "skipped";
+  }
+  return "pending";
+}
+
+void applyWristbandCalibration(const WristbandDataPacket &packet,
+                               const WristbandCalibrationState &state,
+                               WristbandMotionValues &raw,
+                               float &pitchOut,
+                               float &rollOut,
+                               float &yawOut) {
+  wristbandPacketToValues(packet, raw);
+  if (!state.calibrated) {
+    pitchOut = raw.pitchDeg;
+    rollOut = raw.rollDeg;
+    yawOut = state.yawDeg;
+    return;
+  }
+
+  pitchOut = angleDelta(raw.pitchDeg, state.pitchOffsetDeg);
+  rollOut = angleDelta(raw.rollDeg, state.rollOffsetDeg);
+  yawOut = angleDelta(state.yawDeg, state.yawOffsetDeg);
+  raw.accelMps2X -= state.accelOffsetMps2X;
+  raw.accelMps2Y -= state.accelOffsetMps2Y;
+  raw.accelMps2Z -= state.accelOffsetMps2Z;
+}
+
+void updateWristbandConnectionState(uint32_t nowMs) {
+  portENTER_CRITICAL(&stateMux);
+  if (wristCalState.wristWasConnected && latestWristband.seen &&
+      (nowMs - latestWristband.received_ms > DEVICE_TIMEOUT_MS)) {
+    wristCalState.wristWasConnected = false;
+    wristCalState.autoCalibratePending = true;
+    wristCalState.calibrating = false;
+  }
+  portEXIT_CRITICAL(&stateMux);
+}
 
 void debugPrintln(const String &message) {
   if (DEBUG_SERIAL) {
@@ -397,6 +588,31 @@ void handleKeyboardJsonCommand(const String &line) {
   debugPrintln("Unsupported keyboard control: " + control);
 }
 
+void handleWristbandJsonCommand(const String &line) {
+  String control;
+  bool hasControl = extractStringField(line, "control", control) ||
+                    extractStringField(line, "action", control);
+  if (!hasControl) {
+    control = "calibrate";
+  }
+  control.trim();
+  control.toLowerCase();
+
+  if (control == "calibrate" || control == "recalibrate" ||
+      control == "reset" || control == "reset_calibration") {
+    beginWristbandCalibration();
+    if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.print("ANTENNA_WRISTBAND_CONTROL:");
+      Serial.print(control);
+      Serial.println(",started");
+      xSemaphoreGive(serialMutex);
+    }
+    return;
+  }
+
+  debugPrintln("Unsupported wristband control: " + control);
+}
+
 void handleOtaJsonCommand(const String &line) {
   String target;
   if (!extractStringField(line, "target", target)) {
@@ -492,6 +708,10 @@ void handleSerialJsonCommand(const String &line) {
     handleKeyboardJsonCommand(line);
     return;
   }
+  if (cmd == "wristband") {
+    handleWristbandJsonCommand(line);
+    return;
+  }
   if (cmd == "audiodock") {
     String control;
     bool hasControl = extractStringField(line, "control", control) ||
@@ -506,6 +726,18 @@ void handleSerialJsonCommand(const String &line) {
       } else if (control == "speakertest" || control == "speaker_test" ||
                  control == "speaker" || control == "spktest") {
         commandText = "__CMD:SPEAKERTEST__";
+      } else if (control == "training_record" || control == "trainingrecord" ||
+                 control == "record_sample" || control == "sample") {
+        uint16_t count = 1;
+        extractUInt16Field(line, "count", count);
+        if (count > 1) {
+          if (count > 20) {
+            count = 20;
+          }
+          commandText = "__CMD:TRAINING_BATCH:" + String(count) + "__";
+        } else {
+          commandText = "__CMD:TRAINING_RECORD__";
+        }
       } else {
         debugPrintln("Unsupported audiodock control: " + control);
         return;
@@ -774,10 +1006,32 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     WristbandDataPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
     portENTER_CRITICAL(&stateMux);
+    bool reconnect = !wristCalState.wristWasConnected;
+    bool shouldAutoCalibrate =
+        (reconnect || wristCalState.autoCalibratePending) && !wristCalState.calibrating;
     latestWristband.packet = packet;
     latestWristband.seen = true;
     latestWristband.received_ms = millis();
+    updateWristbandYaw(packet);
+    if (shouldAutoCalibrate) {
+      wristCalState.calibrating = true;
+      wristCalState.calibrateStartMs = millis();
+      wristCalState.sumPitch = 0.0;
+      wristCalState.sumRoll = 0.0;
+      wristCalState.sumYaw = 0.0;
+      wristCalState.sumAccelX = 0.0;
+      wristCalState.sumAccelY = 0.0;
+      wristCalState.sumAccelZ = 0.0;
+      wristCalState.calibrateCount = 0;
+      wristCalState.calibrationSkipped = false;
+    }
+    feedWristbandCalibrationSample(packet);
+    wristCalState.wristWasConnected = true;
+    bool logCalibrationStart = shouldAutoCalibrate;
     portEXIT_CRITICAL(&stateMux);
+    if (logCalibrationStart) {
+      logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:started");
+    }
   } else if (header.msg_type == MSG_BATTERY_STATUS &&
              len == static_cast<int>(sizeof(BatteryStatusPacket))) {
     BatteryStatusPacket packet = {};
@@ -927,6 +1181,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
 void printWristbandJson(const LatestWristband &snapshot,
                         const LatestBatteryStatus &batterySnapshot,
+                        const WristbandCalibrationState &calState,
                         uint32_t nowMs) {
   bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
   bool batteryKnown = batterySnapshot.seen;
@@ -995,33 +1250,37 @@ void printWristbandJson(const LatestWristband &snapshot,
     Serial.print("null");
   }
 
+  Serial.print(",\"calibration\":{\"status\":\"");
+  Serial.print(wristbandCalibrationStatusText(calState));
+  Serial.print("\",\"calibrating\":");
+  Serial.print(calState.calibrating ? "true" : "false");
+  Serial.print("}");
+
   if (ok) {
-    float ax = snapshot.packet.accel_mg_x * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float ay = snapshot.packet.accel_mg_y * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float az = snapshot.packet.accel_mg_z * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float gx = snapshot.packet.gyro_mdps_x * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float gy = snapshot.packet.gyro_mdps_y * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float gz = snapshot.packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float pitch = snapshot.packet.pitch_cdeg * AIRTRIXX_CDEG_TO_DEG;
-    float roll = snapshot.packet.roll_cdeg * AIRTRIXX_CDEG_TO_DEG;
+    WristbandMotionValues values = {};
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    float yaw = 0.0f;
+    applyWristbandCalibration(snapshot.packet, calState, values, pitch, roll, yaw);
 
     Serial.print(",\"accel\":{\"x\":");
-    Serial.print(ax, 3);
+    Serial.print(values.accelMps2X, 3);
     Serial.print(",\"y\":");
-    Serial.print(ay, 3);
+    Serial.print(values.accelMps2Y, 3);
     Serial.print(",\"z\":");
-    Serial.print(az, 3);
+    Serial.print(values.accelMps2Z, 3);
     Serial.print("},\"gyro\":{\"x\":");
-    Serial.print(gx, 3);
+    Serial.print(values.gyroDpsX, 3);
     Serial.print(",\"y\":");
-    Serial.print(gy, 3);
+    Serial.print(values.gyroDpsY, 3);
     Serial.print(",\"z\":");
-    Serial.print(gz, 3);
+    Serial.print(values.gyroDpsZ, 3);
     Serial.print("},\"pitch\":");
     Serial.print(pitch, 2);
     Serial.print(",\"roll\":");
     Serial.print(roll, 2);
-    Serial.print(",\"yaw\":null");
+    Serial.print(",\"yaw\":");
+    Serial.print(yaw, 2);
   } else {
     Serial.print(",\"accel\":{\"x\":null,\"y\":null,\"z\":null}");
     Serial.print(",\"gyro\":{\"x\":null,\"y\":null,\"z\":null}");
@@ -1556,10 +1815,12 @@ void printJsonState() {
   LatestKeyboard keyboardSnapshot;
   LatestChargingDock chargingDockSnapshot;
   LatestAudioDock audiodockSnapshot;
+  WristbandCalibrationState wristCalSnapshot;
   uint32_t nowMs = millis();
 
   portENTER_CRITICAL(&stateMux);
   wristSnapshot = latestWristband;
+  wristCalSnapshot = wristCalState;
   wristBatterySnapshot = latestWristbandBattery;
   keyboardBatterySnapshot = latestKeyboardBattery;
   audioDockBatterySnapshot = latestAudioDockBattery;
@@ -1586,7 +1847,7 @@ void printJsonState() {
     Serial.print("\"");
 
     Serial.print(",\"devices\":{");
-    printWristbandJson(wristSnapshot, wristBatterySnapshot, nowMs);
+    printWristbandJson(wristSnapshot, wristBatterySnapshot, wristCalSnapshot, nowMs);
     Serial.print(",");
     printCamDockJson(camSnapshot, nowMs);
     Serial.print(",");
@@ -1669,7 +1930,19 @@ void loop() {
   pumpSerialCommands();
 
   uint32_t nowMs = millis();
-  
+  updateWristbandConnectionState(nowMs);
+
+  bool shouldFinalizeCalibration = false;
+  portENTER_CRITICAL(&stateMux);
+  if (wristCalState.calibrating &&
+      (nowMs - wristCalState.calibrateStartMs >= WRISTBAND_CALIBRATION_MS)) {
+    shouldFinalizeCalibration = true;
+  }
+  portEXIT_CRITICAL(&stateMux);
+  if (shouldFinalizeCalibration) {
+    finalizeWristbandCalibration();
+  }
+
   if (isStreamingAudioDock && (nowMs - lastAudioDockChunkMs >= AUDIODOCK_STREAM_TIMEOUT_MS)) {
     isStreamingAudioDock = false;
   }
