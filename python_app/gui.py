@@ -23,6 +23,14 @@ from PIL import Image, ImageDraw, ImageFont
 from app_paths import project_resource_path
 from config import AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
+from gesture_mapper import (
+    AnalysisResult,
+    TriggerCandidate,
+    analyze,
+    candidate_to_rule,
+    list_gesture_folders,
+    load_gesture_dir,
+)
 from gesture_recorder import GestureRecorder
 from input_backend import FakeInputBackend, PynputInputBackend, normalize_key_token, parse_key_combo
 from input_mapper import (
@@ -364,6 +372,8 @@ class AirTrixxGUI:
             self._snapshot_provider,
             on_status=self.log,
         )
+        self._auto_mapper_candidates: dict[str, TriggerCandidate] = {}
+        self._auto_mapper_analysis: AnalysisResult | None = None
         self.input_backend = PynputInputBackend()
         self.mapping_config_path = self.config.mapping_path
         mapping_config, mapping_error = load_mapping_config(self.mapping_config_path)
@@ -521,6 +531,7 @@ class AirTrixxGUI:
             "Testing",
             "Camera & Servo",
             "Gesture Recorder",
+            "Auto Mapper",
             "Audio Dock",
             "Firmware",
             "Settings",
@@ -559,6 +570,7 @@ class AirTrixxGUI:
         self._build_testing_page(self.pages["Testing"])
         self._build_camera_servo_page(self.pages["Camera & Servo"])
         self._build_gesture_recorder_page(self.pages["Gesture Recorder"])
+        self._build_auto_mapper_page(self.pages["Auto Mapper"])
         self._build_audio_dock_page(self.pages["Audio Dock"])
         self._build_firmware_page(self.pages["Firmware"])
         self._build_settings_page(self.pages["Settings"])
@@ -1562,6 +1574,277 @@ class AirTrixxGUI:
         self.gesture_progress_label.grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
         self.gesture_progress_bar = ttk.Progressbar(status_box, maximum=100, mode="determinate")
         self.gesture_progress_bar.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+
+    def _build_auto_mapper_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(
+            page,
+            "Auto Mapper",
+            "Record a non-gesture baseline first, then your gesture. Analyze the samples to rank difference-based trigger candidates.",
+        )
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        workflow_box = ttk.LabelFrame(body, text="Workflow", padding=10)
+        workflow_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        workflow_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            workflow_box,
+            text="1) Record baseline while still   2) Record gesture   3) Analyze folders   4) Use candidate in Add Mapping",
+            wraplength=760,
+        ).grid(row=0, column=0, sticky="w")
+        shortcuts = ttk.Frame(workflow_box)
+        shortcuts.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        shortcuts.columnconfigure(0, weight=1)
+        shortcuts.columnconfigure(1, weight=1)
+        ttk.Button(
+            shortcuts,
+            text="Record Baseline",
+            command=self._record_baseline_shortcut,
+            style="Secondary.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            shortcuts,
+            text="Record Gesture",
+            command=self._record_gesture_shortcut,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        folder_box = ttk.LabelFrame(body, text="Sample Folders", padding=10)
+        folder_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        folder_box.columnconfigure(1, weight=1)
+        folder_box.columnconfigure(3, weight=1)
+        ttk.Label(folder_box, text="Baseline").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.baseline_folder_var = tk.StringVar()
+        self.baseline_folder_combo = ttk.Combobox(
+            folder_box,
+            textvariable=self.baseline_folder_var,
+            state="readonly",
+        )
+        self.baseline_folder_combo.grid(row=0, column=1, sticky="ew")
+        ttk.Label(folder_box, text="Gesture").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        self.gesture_folder_var = tk.StringVar()
+        self.gesture_folder_combo = ttk.Combobox(
+            folder_box,
+            textvariable=self.gesture_folder_var,
+            state="readonly",
+        )
+        self.gesture_folder_combo.grid(row=0, column=3, sticky="ew")
+        ttk.Button(
+            folder_box,
+            text="Refresh",
+            command=self._refresh_auto_mapper_folders,
+            style="Secondary.TButton",
+        ).grid(row=0, column=4, sticky="ew", padx=(12, 0))
+        self.auto_mapper_folder_info_var = tk.StringVar(value="No gesture folders loaded.")
+        ttk.Label(folder_box, textvariable=self.auto_mapper_folder_info_var, style="PanelSubtle.TLabel").grid(
+            row=1,
+            column=0,
+            columnspan=5,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        analysis_box = ttk.LabelFrame(body, text="Analysis", padding=10)
+        analysis_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        analysis_box.columnconfigure(1, weight=1)
+        ttk.Button(
+            analysis_box,
+            text="Analyze",
+            command=self._analyze_gesture_samples,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="w")
+        self.auto_mapper_status_var = tk.StringVar(value="Select baseline and gesture folders.")
+        ttk.Label(analysis_box, textvariable=self.auto_mapper_status_var, wraplength=700).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(12, 0),
+        )
+
+        results_box = ttk.LabelFrame(body, text="Ranked Candidates", padding=10)
+        results_box.grid(row=3, column=0, sticky="nsew")
+        results_box.columnconfigure(0, weight=1)
+        results_box.rowconfigure(0, weight=1)
+        body.rowconfigure(3, weight=1)
+        columns = ("signal", "comparator", "threshold", "confidence", "rationale")
+        self.auto_mapper_tree = ttk.Treeview(
+            results_box,
+            columns=columns,
+            show="headings",
+            height=12,
+        )
+        self.auto_mapper_tree.heading("signal", text="Signal")
+        self.auto_mapper_tree.heading("comparator", text="Comparator")
+        self.auto_mapper_tree.heading("threshold", text="Threshold")
+        self.auto_mapper_tree.heading("confidence", text="Confidence")
+        self.auto_mapper_tree.heading("rationale", text="Rationale")
+        self.auto_mapper_tree.column("signal", width=180, stretch=False)
+        self.auto_mapper_tree.column("comparator", width=120, stretch=False)
+        self.auto_mapper_tree.column("threshold", width=90, stretch=False)
+        self.auto_mapper_tree.column("confidence", width=90, stretch=False)
+        self.auto_mapper_tree.column("rationale", width=360, stretch=True)
+        self.auto_mapper_tree.grid(row=0, column=0, sticky="nsew")
+        results_scroll = ttk.Scrollbar(results_box, orient="vertical", command=self.auto_mapper_tree.yview)
+        results_scroll.grid(row=0, column=1, sticky="ns")
+        self.auto_mapper_tree.configure(yscrollcommand=results_scroll.set)
+        self._register_scroll_target(self.auto_mapper_tree, self.auto_mapper_tree)
+        self.auto_mapper_tree.bind("<Double-1>", lambda _event: self._use_auto_mapper_candidate())
+        controls = ttk.Frame(results_box)
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.auto_mapper_use_button = ttk.Button(
+            controls,
+            text="Use for Mapping",
+            command=self._use_auto_mapper_candidate,
+            style="Accent.TButton",
+            state="disabled",
+        )
+        self.auto_mapper_use_button.pack(side="left")
+        self._refresh_auto_mapper_folders()
+
+    def _refresh_auto_mapper_folders(self) -> None:
+        folders = list_gesture_folders(self.config.gesture_data_dir)
+        self.baseline_folder_combo.configure(values=folders)
+        self.gesture_folder_combo.configure(values=folders)
+        if self.baseline_folder_var.get() not in folders:
+            baseline_default = "baseline" if "baseline" in folders else (folders[0] if folders else "")
+            self.baseline_folder_var.set(baseline_default)
+        if self.gesture_folder_var.get() not in folders:
+            gesture_default = next((name for name in folders if name != self.baseline_folder_var.get()), "")
+            self.gesture_folder_var.set(gesture_default)
+        baseline_name = self.baseline_folder_var.get()
+        gesture_name = self.gesture_folder_var.get()
+        baseline_count = len(load_gesture_dir(self.config.gesture_data_dir / baseline_name)) if baseline_name else 0
+        gesture_count = len(load_gesture_dir(self.config.gesture_data_dir / gesture_name)) if gesture_name else 0
+        self.auto_mapper_folder_info_var.set(
+            f"Baseline reps: {baseline_count}   Gesture reps: {gesture_count}   Root: {self.config.gesture_data_dir}"
+        )
+
+    def _record_baseline_shortcut(self) -> None:
+        self.gesture_name_var.set("baseline")
+        self.show_page("Gesture Recorder")
+        self.log("Baseline recording: hold still in a neutral pose, then click Record Gesture.")
+
+    def _record_gesture_shortcut(self) -> None:
+        self.show_page("Gesture Recorder")
+        self.log("Gesture recording: enter a gesture name and click Record Gesture.")
+
+    def _analyze_gesture_samples(self) -> None:
+        baseline_name = self.baseline_folder_var.get().strip()
+        gesture_name = self.gesture_folder_var.get().strip()
+        if not baseline_name or not gesture_name:
+            self.auto_mapper_status_var.set("Select both baseline and gesture folders.")
+            return
+        if baseline_name == gesture_name:
+            self.auto_mapper_status_var.set("Baseline and gesture folders must be different.")
+            self.log("Auto Mapper: baseline and gesture folders must be different.")
+            return
+        self.auto_mapper_status_var.set("Analyzing gesture samples...")
+        self.auto_mapper_use_button.configure(state="disabled")
+        self._auto_mapper_candidates.clear()
+        for item in self.auto_mapper_tree.get_children():
+            self.auto_mapper_tree.delete(item)
+        worker = threading.Thread(
+            target=self._analyze_gesture_samples_worker,
+            args=(baseline_name, gesture_name),
+            daemon=True,
+        )
+        worker.start()
+
+    def _analyze_gesture_samples_worker(self, baseline_name: str, gesture_name: str) -> None:
+        try:
+            baseline_reps = load_gesture_dir(self.config.gesture_data_dir / baseline_name)
+            target_reps = load_gesture_dir(self.config.gesture_data_dir / gesture_name)
+            result = analyze(baseline_reps, target_reps)
+        except Exception as exc:
+            try:
+                self.root.after(
+                    0,
+                    lambda: self._finish_auto_mapper_analysis(None, gesture_name, str(exc)),
+                )
+            except tk.TclError:
+                pass
+            return
+        try:
+            self.root.after(
+                0,
+                lambda: self._finish_auto_mapper_analysis(result, gesture_name, None),
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_auto_mapper_analysis(
+        self,
+        result: AnalysisResult | None,
+        gesture_name: str,
+        error: str | None,
+    ) -> None:
+        self._auto_mapper_candidates.clear()
+        for item in self.auto_mapper_tree.get_children():
+            self.auto_mapper_tree.delete(item)
+        if error:
+            self._auto_mapper_analysis = None
+            self.auto_mapper_status_var.set(f"Analysis failed: {error}")
+            self.log(f"Auto Mapper analysis failed: {error}")
+            self.auto_mapper_use_button.configure(state="disabled")
+            return
+        if result is None:
+            self.auto_mapper_status_var.set("Analysis failed.")
+            self.auto_mapper_use_button.configure(state="disabled")
+            return
+        self._auto_mapper_analysis = result
+        for warning in result.warnings:
+            self.log(f"Auto Mapper: {warning}")
+        for index, candidate in enumerate(result.candidates, start=1):
+            item_id = f"candidate-{index}"
+            self._auto_mapper_candidates[item_id] = candidate
+            threshold_text = (
+                "true"
+                if isinstance(candidate.threshold, bool)
+                else self._fmt(candidate.threshold, 3)
+            )
+            self.auto_mapper_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    candidate.source,
+                    candidate.comparator,
+                    threshold_text,
+                    self._fmt(candidate.confidence, 2),
+                    candidate.rationale,
+                ),
+            )
+        if result.candidates:
+            status = (
+                f"Found {len(result.candidates)} candidate(s) from "
+                f"{result.baseline_rep_count} baseline rep(s) and {result.target_rep_count} gesture rep(s)."
+            )
+            self.auto_mapper_use_button.configure(state="normal")
+        else:
+            status = "No discriminating signals found; try a longer gesture or cleaner baseline."
+            self.auto_mapper_use_button.configure(state="disabled")
+        if result.warnings:
+            status = f"{status} {' '.join(result.warnings)}"
+        self.auto_mapper_status_var.set(status)
+        self.log(f"Auto Mapper analysis complete for gesture '{gesture_name}'.")
+
+    def _use_auto_mapper_candidate(self) -> None:
+        selection = self.auto_mapper_tree.selection()
+        if not selection:
+            self.log("Select an Auto Mapper candidate first.")
+            return
+        candidate = self._auto_mapper_candidates.get(selection[0])
+        if candidate is None:
+            self.log("Selected Auto Mapper candidate is no longer available.")
+            return
+        gesture_name = self.gesture_folder_var.get().strip() or candidate.field_key
+        rule = candidate_to_rule(candidate, gesture_name=gesture_name)
+        self.show_page("Mappings")
+        self._open_mapping_dialog(rule, is_new=True)
+        self.log(
+            f"Opened Add Mapping with Auto Mapper candidate {candidate.source} "
+            f"({candidate.comparator}, threshold={candidate.threshold})."
+        )
 
     def _build_testing_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Testing", "Arm one gesture or watch every available gesture without sending PC input.")
