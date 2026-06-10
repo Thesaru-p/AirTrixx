@@ -23,6 +23,14 @@ from PIL import Image, ImageDraw, ImageFont
 from app_paths import project_resource_path
 from config import AppConfig, load_calibration, save_calibration
 from fusion_state import FIELD_ORDER, FusionState
+from gesture_mapper import (
+    AnalysisResult,
+    TriggerCandidate,
+    analyze,
+    candidate_to_rule,
+    list_gesture_folders,
+    load_gesture_dir,
+)
 from gesture_recorder import GestureRecorder
 from input_backend import FakeInputBackend, PynputInputBackend, normalize_key_token, parse_key_combo
 from input_mapper import (
@@ -37,10 +45,11 @@ from input_mapper import (
     load_mapping_config,
     save_mapping_config,
 )
+from keyboard_bridge import KeyboardBridge
 from mediapipe_tracker import HandTracker
 from serial_bridge import SerialBridge
 from servo_controller import ServoController
-from audio_dock import AudioDockBridge
+from audio_dock import AudioDockBridge, TRAINING_LABELS
 
 
 SERVO_BRACKETS = {
@@ -216,6 +225,7 @@ MAPPING_ACTION_OPTIONS = (
     "keyboard_tap",
     "keyboard_hold",
     "keyboard_repeat",
+    "keyboard_text",
     "mouse_click",
     "mouse_hold",
     "mouse_scroll",
@@ -260,6 +270,7 @@ class AirTrixxGUI:
         self.dashboard_battery_cards: dict[str, dict[str, Any]] = {}
         self.keyboard_cells: list[list[tk.Label]] = []
         self.keyboard_status_var = tk.StringVar(value="Keyboard: waiting for ToF data.")
+        self.keyboard_connection_var = tk.StringVar(value="Antenna ESP-NOW: waiting")
         self.hub_status_var = tk.StringVar(value="Hub: disconnected")
         self.mapper_chip_var = tk.StringVar(value="Mapper: disabled")
         self.camera_chip_var = tk.StringVar(value="Camera: starting")
@@ -280,6 +291,7 @@ class AirTrixxGUI:
         self._serial_connect_generation = 0
         self._serial_failed_until: dict[str, float] = {}
         self._serial_last_port_scan: list[dict[str, str]] = []
+        self.audio_dock_autoconnect_enabled = True
         self.camera_centering_active = True
         self.camera_centering_started_s: float | None = None
         self.camera_centering_settled_s: float | None = None
@@ -303,17 +315,51 @@ class AirTrixxGUI:
         self.hand_calibration_auto_capture = True
         self._calibration_last_trackable_hands: dict[str, dict[str, Any]] = {}
 
+        self.keyboard_port_var = tk.StringVar()
+        self.keyboard_prediction_var = tk.StringVar(value="-")
+        self.keyboard_confidence_var = tk.StringVar(value="-")
+        self.keyboard_model_var = tk.StringVar(value="Model: loading")
+        self.keyboard_training_status_var = tk.StringVar(value="Training: idle")
+        self.keyboard_words_var = tk.StringVar(value="hello, world")
+        self.keyboard_repetitions_var = tk.StringVar(value="3")
+        self.keyboard_include_commands_var = tk.BooleanVar(value=True)
+        self.keyboard_reset_dataset_var = tk.BooleanVar(value=False)
+        self.keyboard_live_enabled_var = tk.BooleanVar(value=True)
+        self.keyboard_mapping_var = tk.StringVar(value="Mapping: not installed")
+        self.keyboard_bridge = KeyboardBridge(
+            dataset_path=self.config.keyboard_dataset_path,
+            model_path=self.config.keyboard_model_path,
+            words_path=self.config.keyboard_words_path,
+            on_log=self._on_keyboard_log,
+            on_status=self._on_keyboard_status,
+            on_prediction=self._on_keyboard_prediction,
+            on_training=self._on_keyboard_training,
+        )
+        if self.keyboard_bridge.model_words:
+            self.keyboard_words_var.set(", ".join(self.keyboard_bridge.model_words[:8]))
+            self.keyboard_model_var.set(f"Model: {len(self.keyboard_bridge.model_words)} word(s)")
+        elif self.keyboard_bridge.model_error:
+            self.keyboard_model_var.set(f"Model: {self.keyboard_bridge.model_error}")
+
         # Initialize Audio Dock variables and instance
         self.audio_dock_status_var = tk.StringVar(value="Disconnected")
         self.audio_dock_last_trigger_var = tk.StringVar(value="-")
         self.audio_dock_latest_transcript_var = tk.StringVar(value="-")
         self.audio_dock_port_var = tk.StringVar()
+        self.audio_training_mode_var = tk.BooleanVar(value=False)
+        self.audio_training_label_var = tk.StringVar(value=TRAINING_LABELS[0])
+        self.audio_training_count_var = tk.StringVar(value="10")
+        self.audio_training_status_var = tk.StringVar(value="Training: idle")
+        self.audio_training_sample_count_var = tk.StringVar(value="Saved clips: 0")
         self.audio_dock_bridge = AudioDockBridge(
             on_log=self._on_audio_dock_log,
             on_status=self._on_audio_dock_status,
             on_transcript=self._on_audio_dock_transcript,
+            on_training=self._on_audio_dock_training,
+            on_training_sample=self._on_audio_dock_training_sample,
             deepgram_api_key=str(self.config.calibration.get("deepgram_api_key", "")),
             audio_recording_path=self.config.audio_recording_path,
+            training_data_dir=self.config.audio_training_dir,
         )
         self.audio_dock_bridge.serial_bridge = self.serial_bridge
         self.serial_bridge.audio_dock_bridge = self.audio_dock_bridge
@@ -326,6 +372,8 @@ class AirTrixxGUI:
             self._snapshot_provider,
             on_status=self.log,
         )
+        self._auto_mapper_candidates: dict[str, TriggerCandidate] = {}
+        self._auto_mapper_analysis: AnalysisResult | None = None
         self.input_backend = PynputInputBackend()
         self.mapping_config_path = self.config.mapping_path
         mapping_config, mapping_error = load_mapping_config(self.mapping_config_path)
@@ -353,6 +401,7 @@ class AirTrixxGUI:
         self.testing_last_label = ""
         self.testing_last_seen_s = 0.0
         self._last_runtime_perf_settings: tuple[int, int, int, bool] | None = None
+        self._ensure_keyboard_typing_mapping(save=True)
         if mapping_error:
             self.log(f"Input mappings reset because config could not be loaded: {mapping_error}")
         if self.input_backend.error:
@@ -477,10 +526,12 @@ class AirTrixxGUI:
         nav_items = (
             "Dashboard",
             "Signals",
+            "Keyboard",
             "Mappings",
             "Testing",
             "Camera & Servo",
             "Gesture Recorder",
+            "Auto Mapper",
             "Audio Dock",
             "Firmware",
             "Settings",
@@ -514,10 +565,12 @@ class AirTrixxGUI:
 
         self._build_dashboard_page(self.pages["Dashboard"])
         self._build_signals_page(self.pages["Signals"])
+        self._build_keyboard_page(self.pages["Keyboard"])
         self._build_mappings_page(self.pages["Mappings"])
         self._build_testing_page(self.pages["Testing"])
         self._build_camera_servo_page(self.pages["Camera & Servo"])
         self._build_gesture_recorder_page(self.pages["Gesture Recorder"])
+        self._build_auto_mapper_page(self.pages["Auto Mapper"])
         self._build_audio_dock_page(self.pages["Audio Dock"])
         self._build_firmware_page(self.pages["Firmware"])
         self._build_settings_page(self.pages["Settings"])
@@ -793,9 +846,18 @@ class AirTrixxGUI:
 
     @staticmethod
     def _battery_status_style(level: float | None, status: str) -> tuple[str, str, str, str]:
-        normalized = status.strip().lower()
+        normalized = status.strip().lower().replace("_", " ")
         if level is None:
-            if normalized in {"ok", "connected", "ready", "live"}:
+            if normalized in {
+                "ok",
+                "connected",
+                "ready",
+                "live",
+                "waiting for clap",
+                "receiving audio",
+                "transcribing",
+                "sending transcript",
+            }:
                 return "Online", "#f2f4f7", "#475467", "#98a2b3"
             return "No data", "#f2f4f7", "#475467", "#98a2b3"
         if level <= 15:
@@ -820,6 +882,76 @@ class AirTrixxGUI:
         if fill_width > 0:
             bar.create_rectangle(0, 0, fill_width, height, fill=color, outline=color)
 
+    def _audio_dock_input_value(self, device: dict[str, Any] | None = None) -> Any:
+        if self.audio_dock_bridge.latest_transcript:
+            return self.audio_dock_bridge.latest_transcript
+        device_input = device.get("input") if isinstance(device, dict) else None
+        return device_input if device_input not in (None, "") else "TBD"
+
+    def _audio_dock_device_state(self, device: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = dict(device) if isinstance(device, dict) else {}
+        if self.audio_dock_bridge.is_connected:
+            state["status"] = self.audio_dock_bridge.status
+        else:
+            state.setdefault("status", self.audio_dock_bridge.status)
+        state["app_connected"] = self.audio_dock_bridge.is_connected
+        state["bridge_status"] = self.audio_dock_bridge.status
+        state["last_trigger"] = self.audio_dock_bridge.last_trigger
+        state["latest_transcript"] = self.audio_dock_bridge.latest_transcript
+        state["input"] = self._audio_dock_input_value(state)
+        return state
+
+    def _keyboard_device_state(self, device: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = dict(device) if isinstance(device, dict) else {}
+        bridge_state = self.keyboard_bridge.snapshot()
+        existing_tof = state.get("tof") if isinstance(state.get("tof"), dict) else {}
+        existing_valid = state.get("valid") if isinstance(state.get("valid"), dict) else {}
+        bridge_tof = bridge_state.get("tof") if isinstance(bridge_state.get("tof"), dict) else {}
+        bridge_valid = bridge_state.get("valid") if isinstance(bridge_state.get("valid"), dict) else {}
+        merged_tof = dict(existing_tof)
+        merged_valid = dict(existing_valid)
+        for key, value in bridge_tof.items():
+            if value is not None:
+                merged_tof[key] = value
+        for key, value in bridge_valid.items():
+            if value:
+                merged_valid[key] = value
+        state.update({key: value for key, value in bridge_state.items() if key not in {"tof", "valid"}})
+        state["tof"] = merged_tof
+        state["valid"] = merged_valid
+        if self.keyboard_bridge.is_connected:
+            state["status"] = self.keyboard_bridge.status.lower()
+        else:
+            state.setdefault("status", bridge_state.get("status", "not_connected"))
+        return state
+
+    def _serial_state_with_audio_dock_overlay(self, serial_state: dict[str, Any]) -> dict[str, Any]:
+        state = copy.deepcopy(serial_state) if isinstance(serial_state, dict) else {}
+        if not state and not self.serial_bridge.is_connected and not self.keyboard_bridge.source_ready:
+            return state
+        devices = state.get("devices")
+        if not isinstance(devices, dict):
+            devices = {}
+            state["devices"] = devices
+        keyboard_device = devices.get("keyboard")
+        self.keyboard_bridge.ingest_antenna_device(keyboard_device if isinstance(keyboard_device, dict) else None)
+        devices["keyboard"] = self._keyboard_device_state(devices.get("keyboard"))
+        devices["audiodock"] = self._audio_dock_device_state(devices.get("audiodock"))
+        return state
+
+    def _apply_audio_dock_snapshot_fields(self, snapshot: dict[str, Any]) -> None:
+        input_dict = snapshot.get("input_dict", {})
+        if not isinstance(input_dict, dict):
+            return
+        raw_state = snapshot.get("raw_device_state", {})
+        devices = raw_state.get("devices", {}) if isinstance(raw_state, dict) else {}
+        keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
+        audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
+        if isinstance(keyboard, dict):
+            input_dict["keyboard_input"] = keyboard.get("input")
+        input_dict["audiodock_input"] = self._audio_dock_input_value(audiodock if isinstance(audiodock, dict) else {})
+        snapshot["input_array"] = [input_dict.get(field) for field in FIELD_ORDER]
+
     def _dashboard_battery_device_state(self, device_key: str, devices: dict[str, Any]) -> dict[str, Any]:
         if device_key == "antenna":
             return {"status": "connected" if self.serial_bridge.is_connected else "disconnected"}
@@ -828,11 +960,10 @@ class AirTrixxGUI:
             return {"status": status}
         if device_key == "audiodock":
             device = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
-            if not isinstance(device, dict):
-                device = {}
-            state = dict(device)
-            state.setdefault("status", self.audio_dock_bridge.status)
-            return state
+            return self._audio_dock_device_state(device if isinstance(device, dict) else {})
+        if device_key == "keyboard":
+            device = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
+            return self._keyboard_device_state(device if isinstance(device, dict) else {})
         device = devices.get(device_key, {}) if isinstance(devices, dict) else {}
         return device if isinstance(device, dict) else {}
 
@@ -900,17 +1031,63 @@ class AirTrixxGUI:
         self.preview_label.grid(row=0, column=0, sticky="w")
 
     def _build_keyboard_page(self, page: ttk.Frame) -> None:
-        self._build_page_header(page, "Keyboard", "Four ToF lanes mapped from 0 to 300 mm in 10 mm bands.")
-        body = self._scrollable_body(page)
-        body.columnconfigure(0, weight=1)
+        self._build_page_header(page, "Keyboard", "Antenna ESP-NOW keyboard training, live word prediction, mapping output, and ToF lanes.")
+        page.rowconfigure(1, weight=1)
+        page.columnconfigure(0, weight=1)
 
-        status_box = ttk.LabelFrame(body, text="Keyboard Status", padding=10)
-        status_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        status_box.columnconfigure(0, weight=1)
-        ttk.Label(status_box, textvariable=self.keyboard_status_var, wraplength=760).grid(row=0, column=0, sticky="ew")
+        notebook = ttk.Notebook(page)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        live_tab = ttk.Frame(notebook, padding=6)
+        training_tab = ttk.Frame(notebook, padding=6)
+        log_tab = ttk.Frame(notebook, padding=6)
+        for tab in (live_tab, training_tab):
+            tab.rowconfigure(1, weight=1)
+            tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+        for tab in (log_tab,):
+            tab.columnconfigure(0, weight=1)
 
-        grid_box = ttk.LabelFrame(body, text="ToF Distance Grid", padding=10)
-        grid_box.grid(row=1, column=0, sticky="ew")
+        live_body = self._scrollable_body(live_tab)
+        live_body.columnconfigure(0, weight=1)
+        controls = ttk.LabelFrame(live_body, text="Antenna ESP-NOW", padding=10)
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        controls.columnconfigure(1, weight=1)
+        ttk.Label(controls, text="Source").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(controls, textvariable=self.keyboard_connection_var, font=("Segoe UI Semibold", 10)).grid(
+            row=0, column=1, sticky="w"
+        )
+        ttk.Button(controls, text="Calibrate", command=self.keyboard_reset_calibration, style="Secondary.TButton").grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+        ttk.Checkbutton(
+            controls,
+            text="Live prediction",
+            variable=self.keyboard_live_enabled_var,
+            command=self.toggle_keyboard_live_prediction,
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+        status_box = ttk.LabelFrame(live_body, text="Prediction", padding=10)
+        status_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status_box.columnconfigure(1, weight=1)
+        ttk.Label(status_box, textvariable=self.keyboard_status_var, wraplength=880).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6)
+        )
+        ttk.Label(status_box, text="Latest word").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
+        ttk.Label(status_box, textvariable=self.keyboard_prediction_var, font=("Segoe UI Semibold", 10)).grid(
+            row=1, column=1, sticky="w", pady=4
+        )
+        ttk.Label(status_box, text="Confidence").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 8))
+        ttk.Label(status_box, textvariable=self.keyboard_confidence_var).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(status_box, text="Model").grid(row=3, column=0, sticky="w", pady=4, padx=(0, 8))
+        ttk.Label(status_box, textvariable=self.keyboard_model_var).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(status_box, text="Typing mapping").grid(row=4, column=0, sticky="w", pady=4, padx=(0, 8))
+        ttk.Label(status_box, textvariable=self.keyboard_mapping_var).grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Button(status_box, text="Repair Mapping", command=lambda: self._ensure_keyboard_typing_mapping(save=True)).grid(
+            row=4, column=2, sticky="e", padx=(8, 0)
+        )
+
+        grid_box = ttk.LabelFrame(live_body, text="ToF Distance Grid", padding=10)
+        grid_box.grid(row=2, column=0, sticky="ew")
         for col in range(5):
             grid_box.columnconfigure(col, weight=1 if col > 0 else 0)
 
@@ -937,6 +1114,236 @@ class AirTrixxGUI:
                 label.grid(row=row + 1, column=col + 1, sticky="nsew", padx=1, pady=1)
                 cells.append(label)
             self.keyboard_cells.append(cells)
+
+        training_body = self._scrollable_body(training_tab)
+        training_body.columnconfigure(0, weight=1)
+        train_box = ttk.LabelFrame(training_body, text="Word Training", padding=10)
+        train_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        train_box.columnconfigure(1, weight=1)
+        ttk.Label(train_box, text="Words").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(train_box, textvariable=self.keyboard_words_var).grid(row=0, column=1, columnspan=3, sticky="ew", pady=4)
+        ttk.Label(train_box, text="Samples / word").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(train_box, textvariable=self.keyboard_repetitions_var, width=10).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(train_box, text="Add command keys", variable=self.keyboard_include_commands_var).grid(
+            row=1, column=2, sticky="w", padx=(12, 0), pady=4
+        )
+        ttk.Checkbutton(train_box, text="Replace dataset", variable=self.keyboard_reset_dataset_var).grid(
+            row=1, column=3, sticky="w", padx=(12, 0), pady=4
+        )
+        actions = ttk.Frame(train_box)
+        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
+        ttk.Button(actions, text="Start Plan", command=self.keyboard_start_training).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(actions, text="Record Next", command=self.keyboard_record_next_sample).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(actions, text="Train Model", command=self.keyboard_train_model).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(actions, text="Cancel", command=self.keyboard_cancel_training).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
+        train_status = ttk.LabelFrame(training_body, text="Training Status", padding=10)
+        train_status.grid(row=1, column=0, sticky="ew")
+        train_status.columnconfigure(0, weight=1)
+        ttk.Label(train_status, textvariable=self.keyboard_training_status_var, wraplength=900).grid(row=0, column=0, sticky="ew")
+        self.keyboard_training_progress = ttk.Progressbar(train_status, mode="determinate", maximum=1)
+        self.keyboard_training_progress.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(train_status, text=f"Dataset: {self.config.keyboard_dataset_path}").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(train_status, text=f"Model: {self.config.keyboard_model_path}").grid(row=3, column=0, sticky="w")
+
+        log_tab.rowconfigure(0, weight=1)
+        log_tab.columnconfigure(0, weight=1)
+        self.keyboard_log_text = tk.Text(log_tab, height=10, wrap="word")
+        self.keyboard_log_text.grid(row=0, column=0, sticky="nsew")
+        self._style_text_widget(self.keyboard_log_text, dark=True)
+        self._register_scroll_target(self.keyboard_log_text, self.keyboard_log_text)
+
+        notebook.add(live_tab, text="Live")
+        notebook.add(training_tab, text="Training")
+        notebook.add(log_tab, text="Log")
+
+    def _ensure_keyboard_typing_mapping(self, *, save: bool) -> None:
+        profile = self.input_mapper.config.active()
+        existing = next(
+            (
+                rule
+                for rule in profile.mappings
+                if rule.id == "keyboard_type_prediction"
+                or (
+                    rule.source == "keyboard.input"
+                    and rule.action.type == "keyboard_text"
+                    and rule.action.text_source in {"", "keyboard.input"}
+                )
+            ),
+            None,
+        )
+        if existing is None:
+            profile.mappings.append(
+                MappingRule(
+                    id="keyboard_type_prediction",
+                    name="Keyboard: type predicted word",
+                    enabled=True,
+                    source="keyboard.input",
+                    comparator="present",
+                    threshold=True,
+                    debounce_ms=0,
+                    recognition_label="Keyboard word typed",
+                    action=MappingAction(
+                        type="keyboard_text",
+                        text_source="keyboard.input",
+                        append_space=True,
+                    ),
+                )
+            )
+            if save:
+                save_mapping_config(self.input_mapper.config, self.mapping_config_path)
+            self._schedule_mapping_views_refresh()
+            self.keyboard_mapping_var.set("Mapping: keyboard.input -> type text")
+            self.log("Installed keyboard typing mapping: keyboard.input -> type predicted word.")
+            return
+        self.keyboard_mapping_var.set("Mapping: keyboard.input -> type text")
+
+    def _refresh_keyboard_ports(self) -> None:
+        if not hasattr(self, "keyboard_port_combo"):
+            return
+        ports = sorted(self.keyboard_bridge.available_ports(), key=self._serial_port_sort_key)
+        values = [self._serial_port_label(port) for port in ports]
+        self.keyboard_port_combo["values"] = values
+        active = self.keyboard_bridge.current_port
+        if active:
+            label = next((value for value in values if str(value).startswith(f"{active} - ")), None)
+            if label:
+                self.keyboard_port_var.set(label)
+                return
+        if values and not self.keyboard_port_var.get():
+            self.keyboard_port_var.set(self._preferred_serial_label(values) or values[0])
+
+    def toggle_keyboard_bridge(self) -> None:
+        if self.keyboard_bridge.is_connected:
+            self.keyboard_bridge.disconnect()
+            self._sync_keyboard_controls()
+            return
+        selected = self.keyboard_port_var.get().split(" - ", 1)[0].strip() or None
+        if self.keyboard_bridge.connect(selected):
+            self.keyboard_bridge.set_live_prediction_enabled(self.keyboard_live_enabled_var.get())
+            self._sync_keyboard_controls()
+            self._schedule_text_update()
+        else:
+            self.log("Failed to connect to keyboard.")
+            self._sync_keyboard_controls()
+
+    def keyboard_reset_calibration(self) -> None:
+        if not self.serial_bridge.is_connected:
+            self.log("Connect the Antenna before sending keyboard calibration.")
+            return
+        if self.serial_bridge.send_command({"cmd": "keyboard", "control": "calibrate"}):
+            self.keyboard_status_var.set("Keyboard: calibration requested through Antenna.")
+            self.log("Keyboard calibration command sent through Antenna ESP-NOW.")
+        else:
+            self.log("Keyboard calibration command could not be sent; Antenna serial is not ready.")
+
+    def toggle_keyboard_live_prediction(self) -> None:
+        self.keyboard_bridge.set_live_prediction_enabled(self.keyboard_live_enabled_var.get())
+        self._sync_keyboard_controls()
+
+    def keyboard_start_training(self) -> None:
+        words = [
+            part.strip()
+            for chunk in self.keyboard_words_var.get().replace("\n", ",").split(",")
+            for part in chunk.split()
+            if part.strip()
+        ]
+        try:
+            repetitions = max(1, int(float(self.keyboard_repetitions_var.get() or 1)))
+        except ValueError:
+            repetitions = 1
+            self.keyboard_repetitions_var.set("1")
+        if self.keyboard_bridge.start_training(
+            words,
+            repetitions=repetitions,
+            include_command_words=self.keyboard_include_commands_var.get(),
+            reset_dataset=self.keyboard_reset_dataset_var.get(),
+        ):
+            self.keyboard_reset_dataset_var.set(False)
+
+    def keyboard_record_next_sample(self) -> None:
+        self.keyboard_bridge.arm_next_training_sample()
+
+    def keyboard_train_model(self) -> None:
+        self.keyboard_bridge.train_model_async()
+
+    def keyboard_cancel_training(self) -> None:
+        self.keyboard_bridge.cancel_training()
+
+    def _on_keyboard_log(self, message: str) -> None:
+        self.log(message)
+        try:
+            self.root.after(0, lambda value=message: self._append_keyboard_log(value))
+        except tk.TclError:
+            pass
+
+    def _append_keyboard_log(self, message: str) -> None:
+        if hasattr(self, "keyboard_log_text") and self.keyboard_log_text.winfo_exists():
+            timestamp = time.strftime("%H:%M:%S")
+            self.keyboard_log_text.insert("end", f"[{timestamp}] {message}\n")
+            self.keyboard_log_text.see("end")
+
+    def _on_keyboard_status(self, status: str) -> None:
+        try:
+            self.root.after(0, lambda value=status: self._set_keyboard_status(value))
+        except tk.TclError:
+            pass
+
+    def _set_keyboard_status(self, status: str) -> None:
+        self.keyboard_status_var.set(f"Keyboard: {status}")
+        self._sync_keyboard_controls()
+        self._schedule_text_update()
+
+    def _on_keyboard_prediction(self, word: str, confidence: float, ranking: list[tuple[str, float]]) -> None:
+        try:
+            self.root.after(0, lambda w=word, c=confidence, r=ranking: self._set_keyboard_prediction(w, c, r))
+        except tk.TclError:
+            pass
+
+    def _set_keyboard_prediction(self, word: str, confidence: float, ranking: list[tuple[str, float]]) -> None:
+        self.keyboard_prediction_var.set(word)
+        ranking_text = ", ".join(f"{match} {score * 100:.1f}%" for match, score in ranking[:3])
+        self.keyboard_confidence_var.set(f"{confidence * 100:.1f}% ({ranking_text})" if ranking_text else f"{confidence * 100:.1f}%")
+        self._schedule_text_update()
+
+    def _on_keyboard_training(self, payload: dict[str, Any]) -> None:
+        try:
+            self.root.after(0, lambda value=payload: self._set_keyboard_training(value))
+        except tk.TclError:
+            pass
+
+    def _set_keyboard_training(self, payload: dict[str, Any]) -> None:
+        status = str(payload.get("status") or "Training: idle")
+        self.keyboard_training_status_var.set(status)
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        if hasattr(self, "keyboard_training_progress"):
+            self.keyboard_training_progress.configure(maximum=max(1, total), value=min(completed, max(1, total)))
+        if self.keyboard_bridge.model_words:
+            self.keyboard_model_var.set(f"Model: {len(self.keyboard_bridge.model_words)} word(s)")
+        elif self.keyboard_bridge.model_error:
+            self.keyboard_model_var.set(f"Model: {self.keyboard_bridge.model_error}")
+        self._schedule_text_update()
+
+    def _sync_keyboard_controls(self) -> None:
+        if hasattr(self, "keyboard_connect_button") and self.keyboard_connect_button.winfo_exists():
+            self.keyboard_connect_button.configure(
+                text="Disconnect" if self.keyboard_bridge.is_connected else "Connect",
+                state="normal",
+            )
+        if hasattr(self, "keyboard_connection_var"):
+            if not self.serial_bridge.is_connected:
+                self.keyboard_connection_var.set("Antenna ESP-NOW: Antenna disconnected")
+            elif self.keyboard_bridge.antenna_active:
+                self.keyboard_connection_var.set("Antenna ESP-NOW: receiving")
+            else:
+                self.keyboard_connection_var.set("Antenna ESP-NOW: waiting for keyboard")
+        if self.keyboard_bridge.model_words:
+            self.keyboard_model_var.set(f"Model: {len(self.keyboard_bridge.model_words)} word(s)")
+        elif self.keyboard_bridge.model_error:
+            self.keyboard_model_var.set(f"Model: {self.keyboard_bridge.model_error}")
 
     def _build_mappings_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Mappings", "Turn live AirTrixx signals into keyboard and mouse input.")
@@ -1167,6 +1574,277 @@ class AirTrixxGUI:
         self.gesture_progress_label.grid(row=4, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
         self.gesture_progress_bar = ttk.Progressbar(status_box, maximum=100, mode="determinate")
         self.gesture_progress_bar.grid(row=4, column=1, sticky="ew", pady=(8, 0))
+
+    def _build_auto_mapper_page(self, page: ttk.Frame) -> None:
+        self._build_page_header(
+            page,
+            "Auto Mapper",
+            "Record a non-gesture baseline first, then your gesture. Analyze the samples to rank difference-based trigger candidates.",
+        )
+        body = self._scrollable_body(page)
+        body.columnconfigure(0, weight=1)
+
+        workflow_box = ttk.LabelFrame(body, text="Workflow", padding=10)
+        workflow_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        workflow_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            workflow_box,
+            text="1) Record baseline while still   2) Record gesture   3) Analyze folders   4) Use candidate in Add Mapping",
+            wraplength=760,
+        ).grid(row=0, column=0, sticky="w")
+        shortcuts = ttk.Frame(workflow_box)
+        shortcuts.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        shortcuts.columnconfigure(0, weight=1)
+        shortcuts.columnconfigure(1, weight=1)
+        ttk.Button(
+            shortcuts,
+            text="Record Baseline",
+            command=self._record_baseline_shortcut,
+            style="Secondary.TButton",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            shortcuts,
+            text="Record Gesture",
+            command=self._record_gesture_shortcut,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        folder_box = ttk.LabelFrame(body, text="Sample Folders", padding=10)
+        folder_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        folder_box.columnconfigure(1, weight=1)
+        folder_box.columnconfigure(3, weight=1)
+        ttk.Label(folder_box, text="Baseline").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.baseline_folder_var = tk.StringVar()
+        self.baseline_folder_combo = ttk.Combobox(
+            folder_box,
+            textvariable=self.baseline_folder_var,
+            state="readonly",
+        )
+        self.baseline_folder_combo.grid(row=0, column=1, sticky="ew")
+        ttk.Label(folder_box, text="Gesture").grid(row=0, column=2, sticky="w", padx=(16, 8))
+        self.gesture_folder_var = tk.StringVar()
+        self.gesture_folder_combo = ttk.Combobox(
+            folder_box,
+            textvariable=self.gesture_folder_var,
+            state="readonly",
+        )
+        self.gesture_folder_combo.grid(row=0, column=3, sticky="ew")
+        ttk.Button(
+            folder_box,
+            text="Refresh",
+            command=self._refresh_auto_mapper_folders,
+            style="Secondary.TButton",
+        ).grid(row=0, column=4, sticky="ew", padx=(12, 0))
+        self.auto_mapper_folder_info_var = tk.StringVar(value="No gesture folders loaded.")
+        ttk.Label(folder_box, textvariable=self.auto_mapper_folder_info_var, style="PanelSubtle.TLabel").grid(
+            row=1,
+            column=0,
+            columnspan=5,
+            sticky="w",
+            pady=(8, 0),
+        )
+
+        analysis_box = ttk.LabelFrame(body, text="Analysis", padding=10)
+        analysis_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        analysis_box.columnconfigure(1, weight=1)
+        ttk.Button(
+            analysis_box,
+            text="Analyze",
+            command=self._analyze_gesture_samples,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, sticky="w")
+        self.auto_mapper_status_var = tk.StringVar(value="Select baseline and gesture folders.")
+        ttk.Label(analysis_box, textvariable=self.auto_mapper_status_var, wraplength=700).grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(12, 0),
+        )
+
+        results_box = ttk.LabelFrame(body, text="Ranked Candidates", padding=10)
+        results_box.grid(row=3, column=0, sticky="nsew")
+        results_box.columnconfigure(0, weight=1)
+        results_box.rowconfigure(0, weight=1)
+        body.rowconfigure(3, weight=1)
+        columns = ("signal", "comparator", "threshold", "confidence", "rationale")
+        self.auto_mapper_tree = ttk.Treeview(
+            results_box,
+            columns=columns,
+            show="headings",
+            height=12,
+        )
+        self.auto_mapper_tree.heading("signal", text="Signal")
+        self.auto_mapper_tree.heading("comparator", text="Comparator")
+        self.auto_mapper_tree.heading("threshold", text="Threshold")
+        self.auto_mapper_tree.heading("confidence", text="Confidence")
+        self.auto_mapper_tree.heading("rationale", text="Rationale")
+        self.auto_mapper_tree.column("signal", width=180, stretch=False)
+        self.auto_mapper_tree.column("comparator", width=120, stretch=False)
+        self.auto_mapper_tree.column("threshold", width=90, stretch=False)
+        self.auto_mapper_tree.column("confidence", width=90, stretch=False)
+        self.auto_mapper_tree.column("rationale", width=360, stretch=True)
+        self.auto_mapper_tree.grid(row=0, column=0, sticky="nsew")
+        results_scroll = ttk.Scrollbar(results_box, orient="vertical", command=self.auto_mapper_tree.yview)
+        results_scroll.grid(row=0, column=1, sticky="ns")
+        self.auto_mapper_tree.configure(yscrollcommand=results_scroll.set)
+        self._register_scroll_target(self.auto_mapper_tree, self.auto_mapper_tree)
+        self.auto_mapper_tree.bind("<Double-1>", lambda _event: self._use_auto_mapper_candidate())
+        controls = ttk.Frame(results_box)
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.auto_mapper_use_button = ttk.Button(
+            controls,
+            text="Use for Mapping",
+            command=self._use_auto_mapper_candidate,
+            style="Accent.TButton",
+            state="disabled",
+        )
+        self.auto_mapper_use_button.pack(side="left")
+        self._refresh_auto_mapper_folders()
+
+    def _refresh_auto_mapper_folders(self) -> None:
+        folders = list_gesture_folders(self.config.gesture_data_dir)
+        self.baseline_folder_combo.configure(values=folders)
+        self.gesture_folder_combo.configure(values=folders)
+        if self.baseline_folder_var.get() not in folders:
+            baseline_default = "baseline" if "baseline" in folders else (folders[0] if folders else "")
+            self.baseline_folder_var.set(baseline_default)
+        if self.gesture_folder_var.get() not in folders:
+            gesture_default = next((name for name in folders if name != self.baseline_folder_var.get()), "")
+            self.gesture_folder_var.set(gesture_default)
+        baseline_name = self.baseline_folder_var.get()
+        gesture_name = self.gesture_folder_var.get()
+        baseline_count = len(load_gesture_dir(self.config.gesture_data_dir / baseline_name)) if baseline_name else 0
+        gesture_count = len(load_gesture_dir(self.config.gesture_data_dir / gesture_name)) if gesture_name else 0
+        self.auto_mapper_folder_info_var.set(
+            f"Baseline reps: {baseline_count}   Gesture reps: {gesture_count}   Root: {self.config.gesture_data_dir}"
+        )
+
+    def _record_baseline_shortcut(self) -> None:
+        self.gesture_name_var.set("baseline")
+        self.show_page("Gesture Recorder")
+        self.log("Baseline recording: hold still in a neutral pose, then click Record Gesture.")
+
+    def _record_gesture_shortcut(self) -> None:
+        self.show_page("Gesture Recorder")
+        self.log("Gesture recording: enter a gesture name and click Record Gesture.")
+
+    def _analyze_gesture_samples(self) -> None:
+        baseline_name = self.baseline_folder_var.get().strip()
+        gesture_name = self.gesture_folder_var.get().strip()
+        if not baseline_name or not gesture_name:
+            self.auto_mapper_status_var.set("Select both baseline and gesture folders.")
+            return
+        if baseline_name == gesture_name:
+            self.auto_mapper_status_var.set("Baseline and gesture folders must be different.")
+            self.log("Auto Mapper: baseline and gesture folders must be different.")
+            return
+        self.auto_mapper_status_var.set("Analyzing gesture samples...")
+        self.auto_mapper_use_button.configure(state="disabled")
+        self._auto_mapper_candidates.clear()
+        for item in self.auto_mapper_tree.get_children():
+            self.auto_mapper_tree.delete(item)
+        worker = threading.Thread(
+            target=self._analyze_gesture_samples_worker,
+            args=(baseline_name, gesture_name),
+            daemon=True,
+        )
+        worker.start()
+
+    def _analyze_gesture_samples_worker(self, baseline_name: str, gesture_name: str) -> None:
+        try:
+            baseline_reps = load_gesture_dir(self.config.gesture_data_dir / baseline_name)
+            target_reps = load_gesture_dir(self.config.gesture_data_dir / gesture_name)
+            result = analyze(baseline_reps, target_reps)
+        except Exception as exc:
+            try:
+                self.root.after(
+                    0,
+                    lambda: self._finish_auto_mapper_analysis(None, gesture_name, str(exc)),
+                )
+            except tk.TclError:
+                pass
+            return
+        try:
+            self.root.after(
+                0,
+                lambda: self._finish_auto_mapper_analysis(result, gesture_name, None),
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_auto_mapper_analysis(
+        self,
+        result: AnalysisResult | None,
+        gesture_name: str,
+        error: str | None,
+    ) -> None:
+        self._auto_mapper_candidates.clear()
+        for item in self.auto_mapper_tree.get_children():
+            self.auto_mapper_tree.delete(item)
+        if error:
+            self._auto_mapper_analysis = None
+            self.auto_mapper_status_var.set(f"Analysis failed: {error}")
+            self.log(f"Auto Mapper analysis failed: {error}")
+            self.auto_mapper_use_button.configure(state="disabled")
+            return
+        if result is None:
+            self.auto_mapper_status_var.set("Analysis failed.")
+            self.auto_mapper_use_button.configure(state="disabled")
+            return
+        self._auto_mapper_analysis = result
+        for warning in result.warnings:
+            self.log(f"Auto Mapper: {warning}")
+        for index, candidate in enumerate(result.candidates, start=1):
+            item_id = f"candidate-{index}"
+            self._auto_mapper_candidates[item_id] = candidate
+            threshold_text = (
+                "true"
+                if isinstance(candidate.threshold, bool)
+                else self._fmt(candidate.threshold, 3)
+            )
+            self.auto_mapper_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(
+                    candidate.source,
+                    candidate.comparator,
+                    threshold_text,
+                    self._fmt(candidate.confidence, 2),
+                    candidate.rationale,
+                ),
+            )
+        if result.candidates:
+            status = (
+                f"Found {len(result.candidates)} candidate(s) from "
+                f"{result.baseline_rep_count} baseline rep(s) and {result.target_rep_count} gesture rep(s)."
+            )
+            self.auto_mapper_use_button.configure(state="normal")
+        else:
+            status = "No discriminating signals found; try a longer gesture or cleaner baseline."
+            self.auto_mapper_use_button.configure(state="disabled")
+        if result.warnings:
+            status = f"{status} {' '.join(result.warnings)}"
+        self.auto_mapper_status_var.set(status)
+        self.log(f"Auto Mapper analysis complete for gesture '{gesture_name}'.")
+
+    def _use_auto_mapper_candidate(self) -> None:
+        selection = self.auto_mapper_tree.selection()
+        if not selection:
+            self.log("Select an Auto Mapper candidate first.")
+            return
+        candidate = self._auto_mapper_candidates.get(selection[0])
+        if candidate is None:
+            self.log("Selected Auto Mapper candidate is no longer available.")
+            return
+        gesture_name = self.gesture_folder_var.get().strip() or candidate.field_key
+        rule = candidate_to_rule(candidate, gesture_name=gesture_name)
+        self.show_page("Mappings")
+        self._open_mapping_dialog(rule, is_new=True)
+        self.log(
+            f"Opened Add Mapping with Auto Mapper candidate {candidate.source} "
+            f"({candidate.comparator}, threshold={candidate.threshold})."
+        )
 
     def _build_testing_page(self, page: ttk.Frame) -> None:
         self._build_page_header(page, "Testing", "Arm one gesture or watch every available gesture without sending PC input.")
@@ -1637,7 +2315,7 @@ class AirTrixxGUI:
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         controls.columnconfigure(1, weight=1)
 
-        ttk.Label(controls, text="Bridge port").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(controls, text="Antenna bridge port").grid(row=0, column=0, sticky="w", padx=(0, 8))
         
         self.audio_port_combo = ttk.Combobox(
             controls,
@@ -1677,9 +2355,83 @@ class AirTrixxGUI:
         ttk.Label(status_box, text="Latest Transcription:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Label(status_box, textvariable=self.audio_dock_latest_transcript_var, font=("Segoe UI Semibold", 10)).grid(row=2, column=1, sticky="w", pady=4, padx=8)
 
+        training_box = ttk.LabelFrame(body, text="Training Samples", padding=10)
+        training_box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        training_box.columnconfigure(2, weight=1)
+        training_box.columnconfigure(6, weight=1)
+        training_box.rowconfigure(3, weight=1)
+
+        ttk.Checkbutton(training_box, text="Training mode", variable=self.audio_training_mode_var).grid(
+            row=0, column=0, sticky="w", pady=4, padx=(0, 10)
+        )
+        ttk.Label(training_box, text="Label").grid(row=0, column=1, sticky="e", pady=4, padx=(0, 6))
+        self.audio_training_label_combo = ttk.Combobox(
+            training_box,
+            textvariable=self.audio_training_label_var,
+            values=TRAINING_LABELS,
+            state="readonly",
+            width=18,
+        )
+        self.audio_training_label_combo.grid(row=0, column=2, sticky="w", pady=4)
+
+        ttk.Label(training_box, text="Count").grid(row=0, column=3, sticky="e", pady=4, padx=(8, 4))
+        ttk.Spinbox(
+            training_box,
+            from_=1,
+            to=100,
+            width=6,
+            textvariable=self.audio_training_count_var,
+        ).grid(row=0, column=4, sticky="w", pady=4)
+
+        ttk.Button(training_box, text="Start Capture", command=self.audio_dock_start_training_capture, style="Accent.TButton").grid(
+            row=0, column=5, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Arm Clap Capture", command=self.audio_dock_auto_capture_samples, style="Secondary.TButton").grid(
+            row=0, column=6, sticky="w", padx=(8, 0), pady=4
+        )
+
+        ttk.Button(training_box, text="Save Last", command=self.audio_dock_save_last_sample, style="Secondary.TButton").grid(
+            row=1, column=4, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Stop", command=self.audio_dock_stop_training_capture, style="Secondary.TButton").grid(
+            row=1, column=5, sticky="e", padx=(8, 0), pady=4
+        )
+        ttk.Button(training_box, text="Open Folder", command=self.audio_dock_open_training_folder, style="Secondary.TButton").grid(
+            row=1, column=6, sticky="w", padx=(8, 0), pady=4
+        )
+        ttk.Label(training_box, textvariable=self.audio_training_status_var, font=("Segoe UI Semibold", 10)).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=4
+        )
+        ttk.Label(training_box, textvariable=self.audio_training_sample_count_var).grid(
+            row=1, column=3, sticky="w", padx=(8, 0), pady=4
+        )
+
+        sample_list = ttk.Frame(training_box)
+        sample_list.grid(row=3, column=0, columnspan=7, sticky="nsew", pady=(8, 0))
+        sample_list.columnconfigure(0, weight=1)
+        sample_list.rowconfigure(0, weight=1)
+        self.audio_training_tree = ttk.Treeview(
+            sample_list,
+            columns=("label", "file", "time"),
+            show="headings",
+            height=5,
+            selectmode="browse",
+        )
+        self.audio_training_tree.heading("label", text="Label")
+        self.audio_training_tree.heading("file", text="File")
+        self.audio_training_tree.heading("time", text="Saved")
+        self.audio_training_tree.column("label", width=120, anchor="w", stretch=False)
+        self.audio_training_tree.column("file", width=440, anchor="w")
+        self.audio_training_tree.column("time", width=90, anchor="w", stretch=False)
+        self.audio_training_tree.grid(row=0, column=0, sticky="nsew")
+        sample_scroll = ttk.Scrollbar(sample_list, orient="vertical", command=self.audio_training_tree.yview)
+        sample_scroll.grid(row=0, column=1, sticky="ns")
+        self.audio_training_tree.configure(yscrollcommand=sample_scroll.set)
+        self._refresh_audio_training_samples()
+
         # Log box
         log_box = ttk.LabelFrame(body, text="Audio Dock Console Log", padding=10)
-        log_box.grid(row=2, column=0, sticky="nsew")
+        log_box.grid(row=3, column=0, sticky="nsew")
         log_box.rowconfigure(0, weight=1)
         log_box.columnconfigure(0, weight=1)
 
@@ -1690,18 +2442,37 @@ class AirTrixxGUI:
 
     def toggle_audio_dock(self) -> None:
         if self.audio_dock_bridge.is_connected:
+            self.audio_dock_autoconnect_enabled = False
             self.audio_dock_bridge.disconnect()
-            self.audio_connect_button.configure(text="Connect")
+            self._sync_audio_dock_controls()
             return
 
+        self.audio_dock_autoconnect_enabled = True
         selected = self.audio_dock_port_var.get().split(" - ", 1)[0].strip() or None
-        if not selected:
-            self.log("Audio Dock will use the active Antenna serial bridge.")
+        if not self.serial_bridge.is_connected:
+            if self.serial_connect_in_progress:
+                self.log("Audio Dock is waiting for the Antenna serial connection to finish.")
+                self._sync_audio_dock_controls()
+                return
+            self.refresh_ports()
+            candidates = self._serial_connect_candidates(preferred=selected, auto=False)
+            if not candidates and selected:
+                candidates = [selected]
+            if not candidates:
+                self.log("No Antenna COM ports found for Audio Dock bridge.")
+                self._sync_audio_dock_controls()
+                return
+            self.log("Audio Dock uses the Antenna ESP-NOW bridge; connecting Antenna serial first.")
+            self._start_serial_connect(candidates, auto=False)
+            self._sync_audio_dock_controls()
+            return
 
-        if self.audio_dock_bridge.connect(selected):
-            self.audio_connect_button.configure(text="Disconnect")
+        if self.audio_dock_bridge.connect(None):
+            self._sync_audio_dock_controls()
+            self._schedule_text_update()
         else:
             self.log("Failed to connect to Audio Dock.")
+            self._sync_audio_dock_controls()
 
     def audio_dock_led_test(self) -> None:
         self.audio_dock_bridge.send_control("led_test")
@@ -1709,27 +2480,152 @@ class AirTrixxGUI:
     def audio_dock_speaker_test(self) -> None:
         self.audio_dock_bridge.send_control("speaker_test")
 
+    def _audio_training_count(self) -> int:
+        try:
+            return max(1, min(100, int(self.audio_training_count_var.get())))
+        except (TypeError, ValueError):
+            self.audio_training_count_var.set("10")
+            return 10
+
+    def audio_dock_start_training_capture(self) -> None:
+        self.audio_training_mode_var.set(True)
+        if not self.audio_dock_bridge.is_connected:
+            if not self.audio_dock_bridge.connect(None):
+                self.audio_training_status_var.set("Connect Antenna first")
+                self._sync_audio_dock_controls()
+                return
+            self._sync_audio_dock_controls()
+
+        capture_count = self._audio_training_count()
+        self.audio_dock_bridge.arm_training_capture(self.audio_training_label_var.get(), capture_count)
+        if not self.audio_dock_bridge.send_control("training_record", count=capture_count):
+            self.audio_dock_bridge.cancel_training_capture()
+            self.audio_training_status_var.set("Start capture failed")
+            return
+        self.audio_training_status_var.set(f"Batch recording {self.audio_training_label_var.get()} x{capture_count}...")
+
+    def audio_dock_auto_capture_samples(self) -> None:
+        self.audio_training_mode_var.set(True)
+        self.audio_dock_bridge.arm_training_capture(self.audio_training_label_var.get(), self._audio_training_count())
+
+    def audio_dock_stop_training_capture(self) -> None:
+        self.audio_training_mode_var.set(False)
+        self.audio_dock_bridge.cancel_training_capture()
+
+    def audio_dock_save_last_sample(self) -> None:
+        self.audio_dock_bridge.save_last_training_sample(self.audio_training_label_var.get())
+
+    def audio_dock_open_training_folder(self) -> None:
+        path = self.config.audio_training_dir
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif os.name == "nt":
+                subprocess.Popen(["explorer", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            self.log(f"Opened Audio Dock training folder: {path}")
+        except Exception as exc:
+            self.log(f"Failed to open Audio Dock training folder: {exc}")
+
+    def _refresh_audio_training_samples(self) -> None:
+        if not hasattr(self, "audio_training_tree") or not self.audio_training_tree.winfo_exists():
+            return
+
+        root = self.config.audio_training_dir
+        root.mkdir(parents=True, exist_ok=True)
+        samples: list[Path] = []
+        for sample in root.rglob("*.wav"):
+            if sample.is_file():
+                samples.append(sample)
+
+        samples.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        self.audio_training_tree.delete(*self.audio_training_tree.get_children())
+        for sample in samples[:50]:
+            try:
+                saved_time = time.strftime("%H:%M:%S", time.localtime(sample.stat().st_mtime))
+                display_name = str(sample.relative_to(root))
+            except OSError:
+                saved_time = "-"
+                display_name = sample.name
+            self.audio_training_tree.insert("", "end", values=(sample.parent.name, display_name, saved_time))
+        self.audio_training_sample_count_var.set(f"Saved clips: {len(samples)}")
+
     def _refresh_audio_ports(self) -> None:
         ports = self.serial_bridge.available_ports()
+        ports = sorted(ports, key=self._serial_port_sort_key)
         values = [self._serial_port_label(p) for p in ports]
         self.audio_port_combo["values"] = values
+        active = self.serial_bridge.current_port
+        if active:
+            label = next((value for value in values if str(value).startswith(f"{active} - ")), None)
+            if label:
+                self.audio_dock_port_var.set(label)
+                return
         if values and not self.audio_dock_port_var.get():
-            self.audio_dock_port_var.set(values[0])
+            self.audio_dock_port_var.set(self._preferred_serial_label(values) or values[0])
 
     def _on_audio_dock_log(self, message: str) -> None:
         self.log(message)
+        try:
+            self.root.after(0, lambda value=message: self._append_audio_dock_log(value))
+        except tk.TclError:
+            pass
+
+    def _append_audio_dock_log(self, message: str) -> None:
         if hasattr(self, "audio_log_text") and self.audio_log_text.winfo_exists():
             timestamp = time.strftime("%H:%M:%S")
             self.audio_log_text.insert("end", f"[{timestamp}] {message}\n")
             self.audio_log_text.see("end")
 
     def _on_audio_dock_status(self, status: str) -> None:
+        try:
+            self.root.after(0, lambda value=status: self._set_audio_dock_status(value))
+        except tk.TclError:
+            pass
+
+    def _set_audio_dock_status(self, status: str) -> None:
         self.audio_dock_status_var.set(status)
+        self._sync_audio_dock_controls()
+        self._schedule_text_update()
+
+    def _on_audio_dock_training(self, status: str) -> None:
+        try:
+            self.root.after(0, lambda value=status: self.audio_training_status_var.set(value))
+        except tk.TclError:
+            pass
+
+    def _on_audio_dock_training_sample(self, label: str, path: Path) -> None:
+        try:
+            self.root.after(0, self._after_audio_training_sample_saved)
+        except tk.TclError:
+            pass
+
+    def _after_audio_training_sample_saved(self) -> None:
+        self._refresh_audio_training_samples()
 
     def _on_audio_dock_transcript(self, trigger: str, text: str) -> None:
+        try:
+            self.root.after(0, lambda clap=trigger, value=text: self._set_audio_dock_transcript(clap, value))
+        except tk.TclError:
+            pass
+
+    def _set_audio_dock_transcript(self, trigger: str, text: str) -> None:
         self.audio_dock_last_trigger_var.set(trigger)
         self.audio_dock_latest_transcript_var.set(text)
         self.log(f"Audio Dock Trigger: {trigger} | Transcript: {text}")
+        self._schedule_text_update()
+
+    def _sync_audio_dock_controls(self) -> None:
+        if hasattr(self, "audio_connect_button") and self.audio_connect_button.winfo_exists():
+            if self.serial_connect_in_progress and not self.serial_bridge.is_connected:
+                self.audio_connect_button.configure(text="Connecting...", state="disabled")
+            else:
+                self.audio_connect_button.configure(
+                    text="Disconnect" if self.audio_dock_bridge.is_connected else "Connect",
+                    state="normal",
+                )
 
     def _deepgram_settings_status(self) -> str:
         if str(self.config.calibration.get("deepgram_api_key", "")).strip():
@@ -1885,12 +2781,19 @@ class AirTrixxGUI:
 
     def add_input_mapping(self, source: str | None = None) -> None:
         default_source = source or self._selected_signal_id()
+        action = (
+            MappingAction(type="keyboard_text", text_source=default_source, append_space=True)
+            if default_source == "keyboard.input"
+            else MappingAction(type="keyboard_tap", keys=["space"])
+        )
+        comparator = "present" if default_source == "keyboard.input" else "lt"
+        threshold: Any = True if default_source == "keyboard.input" else 100.0
         rule = MappingRule(
             name=default_source or "New mapping",
             source=default_source,
-            comparator="lt",
-            threshold=100.0,
-            action=MappingAction(type="keyboard_tap", keys=["space"]),
+            comparator=comparator,
+            threshold=threshold,
+            action=action,
         )
         self._open_mapping_dialog(rule, is_new=True)
 
@@ -1957,6 +2860,9 @@ class AirTrixxGUI:
             sources.add(rule.action.absolute_x_source)
         if rule.action.absolute_y_source:
             sources.add(rule.action.absolute_y_source)
+        if rule.action.text_source:
+            sources.add(rule.action.text_source)
+        sources.add("keyboard.input")
         return sorted(sources)
 
     def _open_mapping_dialog(self, rule: MappingRule, *, is_new: bool) -> None:
@@ -1985,6 +2891,9 @@ class AirTrixxGUI:
         debounce_var = tk.StringVar(value=str(working.debounce_ms))
         action_type_var = tk.StringVar(value=working.action.type)
         keys_var = tk.StringVar(value=", ".join(working.action.keys))
+        text_var = tk.StringVar(value=working.action.text)
+        text_source_var = tk.StringVar(value=working.action.text_source)
+        append_space_var = tk.BooleanVar(value=working.action.append_space)
         button_var = tk.StringVar(value=working.action.button)
         clicks_var = tk.StringVar(value=str(working.action.clicks))
         interval_var = tk.StringVar(value=str(working.action.interval_ms))
@@ -2139,6 +3048,17 @@ class AirTrixxGUI:
         record_button = ttk.Button(frame, text="Record", width=16)
         record_button.grid(row=row, column=3, sticky="ew", pady=4)
         row += 1
+        add_label(row, "Text")
+        ttk.Entry(frame, textvariable=text_var).grid(row=row, column=1, sticky="ew", pady=4)
+        add_label(row, "Text source", 2)
+        ttk.Combobox(frame, textvariable=text_source_var, values=source_options).grid(
+            row=row, column=3, sticky="ew", pady=4
+        )
+        row += 1
+        ttk.Checkbutton(frame, text="Append space after text", variable=append_space_var).grid(
+            row=row, column=1, columnspan=3, sticky="w", pady=4
+        )
+        row += 1
         add_label(row, "Mouse button")
         ttk.Combobox(
             frame,
@@ -2287,6 +3207,9 @@ class AirTrixxGUI:
                 {
                     "type": action_type_var.get(),
                     "keys": parse_key_combo(keys_var.get()),
+                    "text": text_var.get(),
+                    "text_source": text_source_var.get().strip(),
+                    "append_space": append_space_var.get(),
                     "button": button_var.get(),
                     "clicks": clicks_var.get(),
                     "interval_ms": interval_var.get(),
@@ -2702,6 +3625,17 @@ class AirTrixxGUI:
         self.camera_popup_label = None
         self._popup_photo = None
 
+    def _auto_connect_audio_dock(self) -> None:
+        if (
+            not self.audio_dock_autoconnect_enabled
+            or self.audio_dock_bridge.is_connected
+            or not self.serial_bridge.is_connected
+        ):
+            return
+        if self.audio_dock_bridge.connect(None):
+            self._sync_audio_dock_controls()
+            self._schedule_text_update()
+
     def refresh_ports(self) -> None:
         ports = self.serial_bridge.available_ports()
         ports = sorted(ports, key=self._serial_port_sort_key)
@@ -2741,6 +3675,8 @@ class AirTrixxGUI:
             self.input_mapper.release_all()
             self.serial_autoconnect_enabled = False
             self._serial_connect_generation += 1
+            if self.audio_dock_bridge.is_connected:
+                self.audio_dock_bridge.disconnect()
             self.serial_bridge.disconnect()
             return
         self.serial_autoconnect_enabled = True
@@ -2832,6 +3768,8 @@ class AirTrixxGUI:
                 self.port_var.set(label)
             self.log(f"{'Auto-c' if auto else 'C'}onnected Antenna serial on {connected_port}.")
             self._home_brackets_on_connect()
+            self._refresh_audio_ports()
+            self._auto_connect_audio_dock()
             return
         self.connect_button.configure(text="Connect")
         if auto and self.serial_autoconnect_enabled and not self.serial_bridge.is_connected:
@@ -3946,6 +4884,7 @@ class AirTrixxGUI:
         self.recorder.stop()
         self.servo_controller.disable_all()
         self.hand_tracker.stop()
+        self.keyboard_bridge.disconnect()
         self.serial_bridge.disconnect()
         self.root.destroy()
 
@@ -3969,7 +4908,12 @@ class AirTrixxGUI:
         self._apply_runtime_performance_settings()
 
         hands = self.hand_tracker.get_latest_hands()
-        serial_state = self.serial_bridge.get_latest_state()
+        if self.serial_bridge.is_connected:
+            self._auto_connect_audio_dock()
+        elif self.audio_dock_bridge.is_connected:
+            self.audio_dock_bridge.disconnect()
+        self._sync_audio_dock_controls()
+        serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
         camera_centering_claimed_servo = False
         if self.centering_bracket is None and self.camera_centering_active:
             camera_centering_claimed_servo = self._update_camera_centering()
@@ -3978,15 +4922,14 @@ class AirTrixxGUI:
         if self.centering_bracket is None and not camera_centering_claimed_servo and not self.hand_calibration_active:
             self.servo_controller.send_for_hands(hands, serial_state)
         self._latest_snapshot = self.fusion_state.build_snapshot(serial_state, hands)
-        input_dict = self._latest_snapshot.get("input_dict", {})
-        if isinstance(input_dict, dict):
-            input_dict["audiodock_input"] = self.audio_dock_bridge.latest_transcript or "TBD"
+        self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         self._latest_snapshot["face_state"] = self.hand_tracker.get_latest_face()
         now_s = time.monotonic()
+        self.keyboard_bridge.tick(now_s=now_s)
         testing_suppressed = bool(self.testing_active and self.testing_output_suppressed_var.get())
         mapper_suppressed = self._focus_is_text_input() or self.mapping_recording_shortcut or testing_suppressed
         try:
-            if self.serial_bridge.is_connected:
+            if self.serial_bridge.is_connected or self.keyboard_bridge.source_ready:
                 self.input_mapper.process(self._latest_snapshot, now_s, suppress_output=mapper_suppressed)
             else:
                 self.input_mapper.release_all()
@@ -4491,7 +5434,8 @@ class AirTrixxGUI:
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
     def _update_text_views(self) -> None:
-        serial_state = self.serial_bridge.get_latest_state()
+        serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
+        self._apply_audio_dock_snapshot_fields(self._latest_snapshot)
         input_dict = self._latest_snapshot.get("input_dict", {})
         input_array = self._latest_snapshot.get("input_array", [])
         page = self.active_page
@@ -4501,6 +5445,10 @@ class AirTrixxGUI:
         if page == "Signals":
             self._update_keyboard_grid(serial_state)
             self._update_data_table(serial_state, input_dict)
+            return
+        if page == "Keyboard":
+            self._update_keyboard_grid(serial_state)
+            self._sync_keyboard_controls()
             return
         if page == "Mappings":
             self._update_mapping_live_views()
@@ -4547,6 +5495,8 @@ class AirTrixxGUI:
         tof = keyboard.get("tof", {}) if isinstance(keyboard, dict) else {}
         valid = keyboard.get("valid", {}) if isinstance(keyboard, dict) else {}
         status = keyboard.get("status", "not_connected") if isinstance(keyboard, dict) else "not_connected"
+        battery_level = keyboard.get("battery_level") if isinstance(keyboard, dict) else None
+        battery_voltage = keyboard.get("battery_voltage") if isinstance(keyboard, dict) else None
 
         inactive_bg = "#f8fafc"
         active_bg = "#22c55e"
@@ -4562,7 +5512,7 @@ class AirTrixxGUI:
             distance = tof.get(f"{sensor_key}_mm") if isinstance(tof, dict) else None
             is_valid = bool(valid.get(sensor_key)) if isinstance(valid, dict) else distance is not None
             distance_text.append(f"S{index + 1}: {self._format_table_value(distance)} mm")
-            if status != "ok" or not is_valid or not isinstance(distance, (int, float)):
+            if str(status).lower() in {"not_connected", "disconnected", "tbd"} or not is_valid or not isinstance(distance, (int, float)):
                 continue
             if distance < 0 or distance > KEYBOARD_DISTANCE_ROWS * KEYBOARD_DISTANCE_BAND_MM:
                 continue
@@ -4570,7 +5520,13 @@ class AirTrixxGUI:
             cell = self.keyboard_cells[row][index]
             cell.configure(bg=active_bg, fg=active_fg, text=f"{distance:.0f} mm")
 
-        self.keyboard_status_var.set(f"Keyboard: {status}. " + ", ".join(distance_text))
+        if battery_level not in (None, ""):
+            battery_text = f"Battery: {self._format_table_value(battery_level)}%"
+            if battery_voltage not in (None, ""):
+                battery_text += f" / {self._format_table_value(battery_voltage)} V"
+        else:
+            battery_text = "Battery: unavailable"
+        self.keyboard_status_var.set(f"Keyboard: {status}. {battery_text}. " + ", ".join(distance_text))
 
     def _update_data_table(self, serial_state: dict[str, Any], input_dict: dict[str, Any]) -> None:
         devices = serial_state.get("devices", {}) if isinstance(serial_state, dict) else {}
@@ -4578,6 +5534,7 @@ class AirTrixxGUI:
         camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
         keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
         charging_dock = devices.get("charging_dock", {}) if isinstance(devices, dict) else {}
+        audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         wrist_accel = wrist.get("accel", {}) if isinstance(wrist, dict) else {}
         wrist_gyro = wrist.get("gyro", {}) if isinstance(wrist, dict) else {}
@@ -4627,6 +5584,8 @@ class AirTrixxGUI:
 
         add("Keyboard", "status", keyboard.get("status") if isinstance(keyboard, dict) else None)
         add("Keyboard", "sequence", keyboard.get("sequence") if isinstance(keyboard, dict) else None)
+        add("Keyboard", "battery_level", keyboard.get("battery_level") if isinstance(keyboard, dict) else None)
+        add("Keyboard", "battery_voltage", keyboard.get("battery_voltage") if isinstance(keyboard, dict) else None)
         for sensor_index in range(1, 5):
             add("Keyboard", f"sensor_{sensor_index}_mm", keyboard_tof.get(f"sensor_{sensor_index}_mm") if isinstance(keyboard_tof, dict) else None)
             add("Keyboard", f"sensor_{sensor_index}_valid", keyboard_valid.get(f"sensor_{sensor_index}") if isinstance(keyboard_valid, dict) else None)
@@ -4708,16 +5667,18 @@ class AirTrixxGUI:
         add("Gesture Recorder", "recording", self.recorder.is_recording)
         add("Gesture Recorder", "gesture_name", self.gesture_name_var.get())
 
-        # Audio Dock status and readings
-        add("Audio Dock", "status", self.audio_dock_bridge.status)
-        add("Audio Dock", "last_trigger", self.audio_dock_bridge.last_trigger)
-        add("Audio Dock", "latest_transcript", self.audio_dock_bridge.latest_transcript)
+        if not isinstance(audiodock, dict):
+            audiodock = {}
+        audio_input = audiodock.get("input") or self._audio_dock_input_value()
+        add("Audio Dock", "status", audiodock.get("status"))
+        add("Audio Dock", "app_connected", audiodock.get("app_connected"))
+        add("Audio Dock", "clap_detected", audiodock.get("clap_detected"))
+        add("Audio Dock", "clap_type", audiodock.get("clap_type"))
+        add("Audio Dock", "last_trigger", audiodock.get("last_trigger"))
+        add("Audio Dock", "latest_transcript", audiodock.get("latest_transcript"))
+        add("Audio Dock", "input", audio_input)
 
-        # Overwrite audiodock_input in fused input
-        if self.audio_dock_bridge.latest_transcript:
-            input_dict["audiodock_input"] = self.audio_dock_bridge.latest_transcript
-        else:
-            input_dict["audiodock_input"] = "TBD"
+        input_dict["audiodock_input"] = audio_input
 
         for field in FIELD_ORDER:
             add("Fused Input", field, input_dict.get(field))
@@ -4789,9 +5750,11 @@ class AirTrixxGUI:
         return str(value)
 
     def _snapshot_provider(self) -> dict[str, Any]:
-        serial_state = self.serial_bridge.get_latest_state()
+        serial_state = self._serial_state_with_audio_dock_overlay(self.serial_bridge.get_latest_state())
         hand_state = self.hand_tracker.get_latest_hands()
-        return self.fusion_state.build_snapshot(serial_state, hand_state)
+        snapshot = self.fusion_state.build_snapshot(serial_state, hand_state)
+        self._apply_audio_dock_snapshot_fields(snapshot)
+        return snapshot
 
     def _apply_runtime_performance_settings(self) -> None:
         width = self._calibration_int("camera_width", self.config.camera_width, 160, 1920)

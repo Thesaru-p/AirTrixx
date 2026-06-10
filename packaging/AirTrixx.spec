@@ -62,6 +62,7 @@ hiddenimports += _collect_submodules("pynput.mouse")
 for source, target in (
     (PROJECT_ROOT / "docs", "docs"),
     (PROJECT_ROOT / "firmware", "firmware"),
+    (PYTHON_APP / "data" / "keyboard", "python_app/data/keyboard"),
 ):
     if source.exists():
         datas.append((str(source), target))

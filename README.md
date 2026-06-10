@@ -7,7 +7,7 @@ AirTrixx is a multi-sensor laptop control prototype that combines:
 - a Cam Dock ESP32-S3 with two VL53L1X ToF sensors and PCA9685 servo control
 - a Wristband ESP32-C3 with MPU6050 IMU sensing and periodic battery telemetry
 - a Fan Controller ESP32-C3 with DS18B20 temperature telemetry and GUI on/off control
-- a Keyboard ESP32-S3 with three VL53L0X ToF lanes through a TCA9548A mux
+- a Keyboard ESP32-S3 with VL53L0X ToF lanes through a TCA9548A mux, Antenna ESP-NOW word training, and live typed-word prediction
 - a Charging Dock ESP32-S3 with four INA219 charging channels and ESP-NOW status telemetry
 - a packaged Python desktop app using Tkinter, OpenCV, MediaPipe Tasks, pyserial, NumPy, Pillow, and pynput
 
@@ -47,6 +47,8 @@ python_app/
   fusion_state.py
   input_mapper.py
   input_backend.py
+  keyboard_bridge.py
+  keyboard_model.py
   gui.py
   status_app.py
   requirements.txt
@@ -132,7 +134,7 @@ The GUI provides:
 - live fused input array display
 - per-signal keyboard and mouse mappings with tap, hold, repeat, scroll, and movement actions
 - fan on/off control, live temperature readings, and wireless fan firmware flash
-- keyboard ToF live data and a 0-300 mm distance grid
+- keyboard ToF live data, a 0-300 mm distance grid, word training controls, prediction log, and default detected-word typing
 - charging dock connection and per-channel charging status
 - camera center command
 - servo calibration save/load
@@ -142,6 +144,8 @@ Runtime config, mappings, logs, and temporary audio files are stored outside the
 
 - Windows: `%APPDATA%\AirTrixx`
 - macOS: `~/Library/Application Support/AirTrixx`
+
+Keyboard training data and the locally retrained model are stored under the same user data root in `keyboard`. The app installs the bundled starter model on first launch, then replaces it when you train new words from the Keyboard page.
 
 ## Package The App
 

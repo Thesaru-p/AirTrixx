@@ -797,6 +797,7 @@ class FusionState:
         camdock = devices.get("camdock", {}) if isinstance(devices, dict) else {}
         keyboard = devices.get("keyboard", {}) if isinstance(devices, dict) else {}
         charging_dock = devices.get("charging_dock", {}) if isinstance(devices, dict) else {}
+        audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         tof = camdock.get("tof", {}) if isinstance(camdock, dict) else {}
         keyboard_tof = keyboard.get("tof", {}) if isinstance(keyboard, dict) else {}
@@ -806,6 +807,7 @@ class FusionState:
         left = hand_state.get("left", {}) if isinstance(hand_state, dict) else {}
         wrist_pitch = wrist.get("pitch")
         wrist_roll = wrist.get("roll")
+        audiodock_input = audiodock.get("input") if isinstance(audiodock, dict) else None
 
         input_dict = {
             "right_hand_x": right.get("x") if right.get("visible") else None,
@@ -833,7 +835,7 @@ class FusionState:
             "keyboard_sensor_3_mm": keyboard_tof.get("sensor_3_mm") if isinstance(keyboard_tof, dict) else None,
             "keyboard_sensor_4_mm": keyboard_tof.get("sensor_4_mm") if isinstance(keyboard_tof, dict) else None,
             "charging_dock_input": charging_dock.get("input") if isinstance(charging_dock, dict) else None,
-            "audiodock_input": "TBD",
+            "audiodock_input": audiodock_input if audiodock_input not in (None, "") else "TBD",
             "fans_input": fans.get("input") if isinstance(fans, dict) else None,
         }
         input_dict.update(self._wrist_axis_features(wrist_pitch, wrist_roll, now_s))

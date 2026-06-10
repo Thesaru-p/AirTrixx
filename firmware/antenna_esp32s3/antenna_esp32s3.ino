@@ -65,8 +65,50 @@ struct AIRTRIXX_PACKED LegacyFanStatusPacket {
   uint16_t last_command_sequence;
 };
 
+struct WristbandMotionValues {
+  float accelMps2X = 0.0f;
+  float accelMps2Y = 0.0f;
+  float accelMps2Z = 0.0f;
+  float gyroDpsX = 0.0f;
+  float gyroDpsY = 0.0f;
+  float gyroDpsZ = 0.0f;
+  float pitchDeg = 0.0f;
+  float rollDeg = 0.0f;
+};
+
+struct WristbandCalibrationState {
+  float yawDeg = 0.0f;
+  uint32_t lastOrientMs = 0;
+  bool haveOrient = false;
+
+  bool calibrating = false;
+  uint32_t calibrateStartMs = 0;
+  double sumPitch = 0.0;
+  double sumRoll = 0.0;
+  double sumYaw = 0.0;
+  double sumAccelX = 0.0;
+  double sumAccelY = 0.0;
+  double sumAccelZ = 0.0;
+  uint16_t calibrateCount = 0;
+  bool calibrationSkipped = false;
+
+  bool calibrated = false;
+  float pitchOffsetDeg = 0.0f;
+  float rollOffsetDeg = 0.0f;
+  float yawOffsetDeg = 0.0f;
+  float accelOffsetMps2X = 0.0f;
+  float accelOffsetMps2Y = 0.0f;
+  float accelOffsetMps2Z = 0.0f;
+
+  bool autoCalibratePending = true;
+  bool wristWasConnected = false;
+};
+
 static LatestWristband latestWristband;
+static WristbandCalibrationState wristCalState;
 static LatestBatteryStatus latestWristbandBattery;
+static LatestBatteryStatus latestKeyboardBattery;
+static LatestBatteryStatus latestAudioDockBattery;
 static LatestCamDock latestCamDock;
 static LatestFans latestFans;
 static LatestKeyboard latestKeyboard;
@@ -78,10 +120,15 @@ static uint16_t antennaJsonSequence = 0;
 static uint16_t servoCommandSequence = 0;
 static uint16_t otaCommandSequence = 0;
 static uint16_t fanCommandSequence = 0;
+static uint16_t keyboardCommandSequence = 0;
 static uint32_t lastJsonMs = 0;
 static bool isStreamingAudioDock = false;
 static uint32_t lastAudioDockChunkMs = 0;
+static uint32_t lastAudioDockStatusMs = 0;
+static uint32_t lastAntennaStatusLedMs = 0;
 static const uint32_t AUDIODOCK_STREAM_TIMEOUT_MS = 6000;
+static const uint32_t AUDIODOCK_STATUS_INTERVAL_MS = 500;
+static const uint32_t ANTENNA_STATUS_LED_INTERVAL_MS = 250;
 
 static QueueHandle_t audioChunkQueue = NULL;
 
@@ -90,6 +137,157 @@ static size_t serialLineLen = 0;
 static const uint32_t BATTERY_STATUS_STALE_MS = 11UL * 60UL * 1000UL;
 static const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
+static const uint32_t WRISTBAND_CALIBRATION_MS = 2000;
+static const uint16_t WRISTBAND_CALIBRATION_MIN_SAMPLES = 20;
+
+float angleDelta(float current, float anchor) {
+  return fmodf(current - anchor + 540.0f, 360.0f) - 180.0f;
+}
+
+void wristbandPacketToValues(const WristbandDataPacket &packet, WristbandMotionValues &out) {
+  out.accelMps2X = packet.accel_mg_x * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.accelMps2Y = packet.accel_mg_y * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.accelMps2Z = packet.accel_mg_z * AIRTRIXX_ACCEL_MG_TO_MPS2;
+  out.gyroDpsX = packet.gyro_mdps_x * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.gyroDpsY = packet.gyro_mdps_y * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.gyroDpsZ = packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
+  out.pitchDeg = packet.pitch_cdeg * AIRTRIXX_CDEG_TO_DEG;
+  out.rollDeg = packet.roll_cdeg * AIRTRIXX_CDEG_TO_DEG;
+}
+
+void logWristbandCalibrationLine(const String &message) {
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.println(message);
+    xSemaphoreGive(serialMutex);
+  }
+}
+
+void updateWristbandYaw(const WristbandDataPacket &packet) {
+  if (wristCalState.haveOrient) {
+    uint32_t packetMs = packet.header.t_ms;
+    uint32_t dtMs = packetMs - wristCalState.lastOrientMs;
+    if (packetMs < wristCalState.lastOrientMs) {
+      dtMs = 0;
+    } else if (dtMs > 100) {
+      dtMs = 100;
+    }
+    if (dtMs > 0) {
+      float gyroZDps = packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
+      wristCalState.yawDeg += gyroZDps * (static_cast<float>(dtMs) / 1000.0f);
+    }
+  }
+  wristCalState.lastOrientMs = packet.header.t_ms;
+  wristCalState.haveOrient = true;
+}
+
+void beginWristbandCalibration() {
+  portENTER_CRITICAL(&stateMux);
+  wristCalState.calibrating = true;
+  wristCalState.calibrateStartMs = millis();
+  wristCalState.sumPitch = 0.0;
+  wristCalState.sumRoll = 0.0;
+  wristCalState.sumYaw = 0.0;
+  wristCalState.sumAccelX = 0.0;
+  wristCalState.sumAccelY = 0.0;
+  wristCalState.sumAccelZ = 0.0;
+  wristCalState.calibrateCount = 0;
+  wristCalState.calibrationSkipped = false;
+  portEXIT_CRITICAL(&stateMux);
+  logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:started");
+}
+
+void feedWristbandCalibrationSample(const WristbandDataPacket &packet) {
+  if (!wristCalState.calibrating) {
+    return;
+  }
+
+  WristbandMotionValues values = {};
+  wristbandPacketToValues(packet, values);
+  wristCalState.sumPitch += values.pitchDeg;
+  wristCalState.sumRoll += values.rollDeg;
+  wristCalState.sumYaw += wristCalState.yawDeg;
+  wristCalState.sumAccelX += values.accelMps2X;
+  wristCalState.sumAccelY += values.accelMps2Y;
+  wristCalState.sumAccelZ += values.accelMps2Z;
+  wristCalState.calibrateCount++;
+}
+
+void finalizeWristbandCalibration() {
+  portENTER_CRITICAL(&stateMux);
+  if (!wristCalState.calibrating) {
+    portEXIT_CRITICAL(&stateMux);
+    return;
+  }
+
+  uint16_t count = wristCalState.calibrateCount;
+  wristCalState.calibrating = false;
+  if (count < WRISTBAND_CALIBRATION_MIN_SAMPLES) {
+    wristCalState.calibrationSkipped = true;
+    portEXIT_CRITICAL(&stateMux);
+    logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:skipped,no_samples");
+    return;
+  }
+
+  float invCount = 1.0f / static_cast<float>(count);
+  wristCalState.pitchOffsetDeg = static_cast<float>(wristCalState.sumPitch * invCount);
+  wristCalState.rollOffsetDeg = static_cast<float>(wristCalState.sumRoll * invCount);
+  wristCalState.yawOffsetDeg = static_cast<float>(wristCalState.sumYaw * invCount);
+  wristCalState.accelOffsetMps2X = static_cast<float>(wristCalState.sumAccelX * invCount);
+  wristCalState.accelOffsetMps2Y = static_cast<float>(wristCalState.sumAccelY * invCount);
+  wristCalState.accelOffsetMps2Z = static_cast<float>(wristCalState.sumAccelZ * invCount);
+  wristCalState.calibrated = true;
+  wristCalState.calibrationSkipped = false;
+  wristCalState.autoCalibratePending = false;
+  portEXIT_CRITICAL(&stateMux);
+
+  logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:complete,samples=" + String(count));
+}
+
+const char *wristbandCalibrationStatusText(const WristbandCalibrationState &state) {
+  if (state.calibrating) {
+    return "calibrating";
+  }
+  if (state.calibrated) {
+    return "ok";
+  }
+  if (state.calibrationSkipped) {
+    return "skipped";
+  }
+  return "pending";
+}
+
+void applyWristbandCalibration(const WristbandDataPacket &packet,
+                               const WristbandCalibrationState &state,
+                               WristbandMotionValues &raw,
+                               float &pitchOut,
+                               float &rollOut,
+                               float &yawOut) {
+  wristbandPacketToValues(packet, raw);
+  if (!state.calibrated) {
+    pitchOut = raw.pitchDeg;
+    rollOut = raw.rollDeg;
+    yawOut = state.yawDeg;
+    return;
+  }
+
+  pitchOut = angleDelta(raw.pitchDeg, state.pitchOffsetDeg);
+  rollOut = angleDelta(raw.rollDeg, state.rollOffsetDeg);
+  yawOut = angleDelta(state.yawDeg, state.yawOffsetDeg);
+  raw.accelMps2X -= state.accelOffsetMps2X;
+  raw.accelMps2Y -= state.accelOffsetMps2Y;
+  raw.accelMps2Z -= state.accelOffsetMps2Z;
+}
+
+void updateWristbandConnectionState(uint32_t nowMs) {
+  portENTER_CRITICAL(&stateMux);
+  if (wristCalState.wristWasConnected && latestWristband.seen &&
+      (nowMs - latestWristband.received_ms > DEVICE_TIMEOUT_MS)) {
+    wristCalState.wristWasConnected = false;
+    wristCalState.autoCalibratePending = true;
+    wristCalState.calibrating = false;
+  }
+  portEXIT_CRITICAL(&stateMux);
+}
 
 void debugPrintln(const String &message) {
   if (DEBUG_SERIAL) {
@@ -334,6 +532,87 @@ void sendFanCommandToFans(const FanCommandPacket &packet) {
   }
 }
 
+bool sendKeyboardCommandToKeyboard(uint8_t command, const String &control) {
+  uint8_t okCount = 0;
+  esp_err_t lastResult = ESP_FAIL;
+
+  for (uint8_t attempt = 0; attempt < 4; ++attempt) {
+    KeyboardCommandPacket packet = {};
+    fillHeader(packet.header,
+               MSG_KEYBOARD_COMMAND,
+               DEVICE_ANTENNA,
+               ++keyboardCommandSequence,
+               millis(),
+               false);
+    packet.command = command;
+    lastResult = esp_now_send(KEYBOARD_MAC_PLACEHOLDER,
+                              reinterpret_cast<const uint8_t *>(&packet),
+                              sizeof(packet));
+    if (lastResult == ESP_OK) {
+      okCount++;
+    }
+    delay(25);
+  }
+
+  if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    Serial.print("ANTENNA_KEYBOARD_CONTROL:");
+    Serial.print(control);
+    Serial.print(",");
+    Serial.print(okCount > 0 ? "sent" : "failed");
+    Serial.print(",ok=");
+    Serial.print(okCount);
+    Serial.print(",last=");
+    Serial.println(lastResult);
+    xSemaphoreGive(serialMutex);
+  }
+
+  return okCount > 0;
+}
+
+void handleKeyboardJsonCommand(const String &line) {
+  String control;
+  bool hasControl = extractStringField(line, "control", control) ||
+                    extractStringField(line, "action", control);
+  if (!hasControl) {
+    control = "calibrate";
+  }
+  control.trim();
+  control.toLowerCase();
+
+  if (control == "calibrate" || control == "recalibrate" ||
+      control == "reset" || control == "reset_calibration") {
+    sendKeyboardCommandToKeyboard(KEYBOARD_CMD_RECALIBRATE, control);
+    return;
+  }
+
+  debugPrintln("Unsupported keyboard control: " + control);
+}
+
+void handleWristbandJsonCommand(const String &line) {
+  String control;
+  bool hasControl = extractStringField(line, "control", control) ||
+                    extractStringField(line, "action", control);
+  if (!hasControl) {
+    control = "calibrate";
+  }
+  control.trim();
+  control.toLowerCase();
+
+  if (control == "calibrate" || control == "recalibrate" ||
+      control == "reset" || control == "reset_calibration") {
+    beginWristbandCalibration();
+    if (serialMutex != NULL && xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.print("ANTENNA_WRISTBAND_CONTROL:");
+      Serial.print(control);
+      Serial.println(",started");
+      xSemaphoreGive(serialMutex);
+    }
+    return;
+  }
+
+  debugPrintln("Unsupported wristband control: " + control);
+}
+
 void handleOtaJsonCommand(const String &line) {
   String target;
   if (!extractStringField(line, "target", target)) {
@@ -425,6 +704,14 @@ void handleSerialJsonCommand(const String &line) {
     handleFanJsonCommand(line);
     return;
   }
+  if (cmd == "keyboard") {
+    handleKeyboardJsonCommand(line);
+    return;
+  }
+  if (cmd == "wristband") {
+    handleWristbandJsonCommand(line);
+    return;
+  }
   if (cmd == "audiodock") {
     String control;
     bool hasControl = extractStringField(line, "control", control) ||
@@ -439,6 +726,18 @@ void handleSerialJsonCommand(const String &line) {
       } else if (control == "speakertest" || control == "speaker_test" ||
                  control == "speaker" || control == "spktest") {
         commandText = "__CMD:SPEAKERTEST__";
+      } else if (control == "training_record" || control == "trainingrecord" ||
+                 control == "record_sample" || control == "sample") {
+        uint16_t count = 1;
+        extractUInt16Field(line, "count", count);
+        if (count > 1) {
+          if (count > 20) {
+            count = 20;
+          }
+          commandText = "__CMD:TRAINING_BATCH:" + String(count) + "__";
+        } else {
+          commandText = "__CMD:TRAINING_RECORD__";
+        }
       } else {
         debugPrintln("Unsupported audiodock control: " + control);
         return;
@@ -585,6 +884,113 @@ bool sendAudioDockTextPacket(const String &text, const char *statusPrefix, const
   return okCount > 0;
 }
 
+bool deviceSeenRecently(bool seen, uint32_t receivedMs, uint32_t nowMs) {
+  return seen && (nowMs - receivedMs <= DEVICE_TIMEOUT_MS);
+}
+
+uint8_t buildAudioDockComponentMask(uint32_t nowMs) {
+  LatestWristband wristSnapshot;
+  LatestCamDock camSnapshot;
+  LatestKeyboard keyboardSnapshot;
+  LatestChargingDock chargingDockSnapshot;
+  LatestAudioDock audiodockSnapshot;
+  LatestFans fansSnapshot;
+
+  portENTER_CRITICAL(&stateMux);
+  wristSnapshot = latestWristband;
+  camSnapshot = latestCamDock;
+  keyboardSnapshot = latestKeyboard;
+  chargingDockSnapshot = latestChargingDock;
+  audiodockSnapshot = latestAudioDock;
+  fansSnapshot = latestFans;
+  portEXIT_CRITICAL(&stateMux);
+
+  // Status ring segment order: wristband, cam dock, keyboard,
+  // charging dock, audio dock, fans. Two spare segments stay dim.
+  uint8_t mask = 0;
+  if (deviceSeenRecently(wristSnapshot.seen, wristSnapshot.received_ms, nowMs)) mask |= 1 << 0;
+  if (deviceSeenRecently(camSnapshot.seen, camSnapshot.received_ms, nowMs)) mask |= 1 << 1;
+  if (deviceSeenRecently(keyboardSnapshot.seen, keyboardSnapshot.received_ms, nowMs)) mask |= 1 << 2;
+  if (deviceSeenRecently(chargingDockSnapshot.seen, chargingDockSnapshot.received_ms, nowMs)) mask |= 1 << 3;
+  if (deviceSeenRecently(audiodockSnapshot.seen, audiodockSnapshot.received_ms, nowMs)) mask |= 1 << 4;
+  if (deviceSeenRecently(fansSnapshot.seen, fansSnapshot.received_ms, nowMs)) mask |= 1 << 5;
+  return mask;
+}
+
+uint8_t countConnectedComponents(uint8_t mask) {
+  uint8_t count = 0;
+  for (uint8_t bit = 0; bit < 6; bit++) {
+    if ((mask & (1 << bit)) != 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+void setAntennaStatusLed(uint8_t r, uint8_t g, uint8_t b) {
+#if defined(RGB_BUILTIN)
+  neopixelWrite(RGB_BUILTIN, r, g, b);
+#elif defined(LED_BUILTIN)
+  digitalWrite(LED_BUILTIN, (r || g || b) ? HIGH : LOW);
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+#endif
+}
+
+void initAntennaStatusLed() {
+#if defined(RGB_BUILTIN)
+  pinMode(RGB_BUILTIN, OUTPUT);
+#elif defined(LED_BUILTIN)
+  pinMode(LED_BUILTIN, OUTPUT);
+#endif
+  setAntennaStatusLed(64, 0, 0);
+}
+
+void updateAntennaStatusLed(uint32_t nowMs) {
+  uint8_t connectedCount = countConnectedComponents(buildAudioDockComponentMask(nowMs));
+  switch (connectedCount) {
+    case 0:
+      setAntennaStatusLed(64, 0, 0);      // red
+      break;
+    case 1:
+      setAntennaStatusLed(48, 48, 48);    // white
+      break;
+    case 2:
+      setAntennaStatusLed(64, 48, 0);     // yellow
+      break;
+    case 3:
+      setAntennaStatusLed(0, 40, 64);     // ocean blue
+      break;
+    case 4:
+      setAntennaStatusLed(64, 0, 32);     // pink
+      break;
+    case 5:
+      setAntennaStatusLed(36, 0, 64);     // purple
+      break;
+    default:
+      setAntennaStatusLed(0, 64, 0);      // green
+      break;
+  }
+}
+
+void sendAudioDockComponentStatus(uint32_t nowMs) {
+  AudioDockTranscriptPacket packet = {};
+  fillHeader(packet.header,
+             MSG_AUDIODOCK_TRANSCRIPT,
+             DEVICE_ANTENNA,
+             ++antennaJsonSequence,
+             nowMs,
+             false);
+  char statusText[16];
+  snprintf(statusText, sizeof(statusText), "__STATUS:%02X", buildAudioDockComponentMask(nowMs));
+  copyStringToPacketField(packet.transcript, sizeof(packet.transcript), String(statusText));
+  esp_now_send(ESPNOW_BROADCAST_MAC,
+               reinterpret_cast<const uint8_t *>(&packet),
+               sizeof(packet));
+}
+
 void handleIncomingPacket(const uint8_t *data, int len) {
   if (len < static_cast<int>(sizeof(AirTrixxPacketHeader))) {
     return;
@@ -600,19 +1006,50 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     WristbandDataPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
     portENTER_CRITICAL(&stateMux);
+    bool reconnect = !wristCalState.wristWasConnected;
+    bool shouldAutoCalibrate =
+        (reconnect || wristCalState.autoCalibratePending) && !wristCalState.calibrating;
     latestWristband.packet = packet;
     latestWristband.seen = true;
     latestWristband.received_ms = millis();
+    updateWristbandYaw(packet);
+    if (shouldAutoCalibrate) {
+      wristCalState.calibrating = true;
+      wristCalState.calibrateStartMs = millis();
+      wristCalState.sumPitch = 0.0;
+      wristCalState.sumRoll = 0.0;
+      wristCalState.sumYaw = 0.0;
+      wristCalState.sumAccelX = 0.0;
+      wristCalState.sumAccelY = 0.0;
+      wristCalState.sumAccelZ = 0.0;
+      wristCalState.calibrateCount = 0;
+      wristCalState.calibrationSkipped = false;
+    }
+    feedWristbandCalibrationSample(packet);
+    wristCalState.wristWasConnected = true;
+    bool logCalibrationStart = shouldAutoCalibrate;
     portEXIT_CRITICAL(&stateMux);
+    if (logCalibrationStart) {
+      logWristbandCalibrationLine("ANTENNA_WRISTBAND_CALIBRATION:started");
+    }
   } else if (header.msg_type == MSG_BATTERY_STATUS &&
-             header.device_id == DEVICE_WRISTBAND &&
              len == static_cast<int>(sizeof(BatteryStatusPacket))) {
     BatteryStatusPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
+    LatestBatteryStatus *target = nullptr;
+    if (header.device_id == DEVICE_WRISTBAND) {
+      target = &latestWristbandBattery;
+    } else if (header.device_id == DEVICE_KEYBOARD) {
+      target = &latestKeyboardBattery;
+    } else if (header.device_id == DEVICE_AUDIODOCK) {
+      target = &latestAudioDockBattery;
+    } else {
+      return;
+    }
     portENTER_CRITICAL(&stateMux);
-    latestWristbandBattery.packet = packet;
-    latestWristbandBattery.seen = true;
-    latestWristbandBattery.received_ms = millis();
+    target->packet = packet;
+    target->seen = true;
+    target->received_ms = millis();
     portEXIT_CRITICAL(&stateMux);
   } else if (header.msg_type == MSG_CAMDOCK_DATA && len == static_cast<int>(sizeof(CamDockDataPacket))) {
     CamDockDataPacket packet = {};
@@ -709,6 +1146,22 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     if (audioChunkQueue != NULL) {
       xQueueSend(audioChunkQueue, &packet, 0);
     }
+  } else if (header.msg_type == MSG_HEARTBEAT && len == static_cast<int>(sizeof(HeartbeatPacket))) {
+    HeartbeatPacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.header.device_id != DEVICE_AUDIODOCK) {
+      return;
+    }
+    AudioDockDataPacket audioStatus = {};
+    audioStatus.header = packet.header;
+    audioStatus.clap_detected = 0;
+    audioStatus.clap_type = 0;
+    audioStatus.audio_size = 0;
+    portENTER_CRITICAL(&stateMux);
+    latestAudioDock.packet = audioStatus;
+    latestAudioDock.seen = true;
+    latestAudioDock.received_ms = millis();
+    portEXIT_CRITICAL(&stateMux);
   } else if (DEBUG_SERIAL) {
     debugPrintln("Unexpected ESP-NOW packet type/size");
   }
@@ -728,6 +1181,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 
 void printWristbandJson(const LatestWristband &snapshot,
                         const LatestBatteryStatus &batterySnapshot,
+                        const WristbandCalibrationState &calState,
                         uint32_t nowMs) {
   bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
   bool batteryKnown = batterySnapshot.seen;
@@ -796,33 +1250,37 @@ void printWristbandJson(const LatestWristband &snapshot,
     Serial.print("null");
   }
 
+  Serial.print(",\"calibration\":{\"status\":\"");
+  Serial.print(wristbandCalibrationStatusText(calState));
+  Serial.print("\",\"calibrating\":");
+  Serial.print(calState.calibrating ? "true" : "false");
+  Serial.print("}");
+
   if (ok) {
-    float ax = snapshot.packet.accel_mg_x * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float ay = snapshot.packet.accel_mg_y * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float az = snapshot.packet.accel_mg_z * AIRTRIXX_ACCEL_MG_TO_MPS2;
-    float gx = snapshot.packet.gyro_mdps_x * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float gy = snapshot.packet.gyro_mdps_y * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float gz = snapshot.packet.gyro_mdps_z * AIRTRIXX_GYRO_MDPS_TO_DPS;
-    float pitch = snapshot.packet.pitch_cdeg * AIRTRIXX_CDEG_TO_DEG;
-    float roll = snapshot.packet.roll_cdeg * AIRTRIXX_CDEG_TO_DEG;
+    WristbandMotionValues values = {};
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    float yaw = 0.0f;
+    applyWristbandCalibration(snapshot.packet, calState, values, pitch, roll, yaw);
 
     Serial.print(",\"accel\":{\"x\":");
-    Serial.print(ax, 3);
+    Serial.print(values.accelMps2X, 3);
     Serial.print(",\"y\":");
-    Serial.print(ay, 3);
+    Serial.print(values.accelMps2Y, 3);
     Serial.print(",\"z\":");
-    Serial.print(az, 3);
+    Serial.print(values.accelMps2Z, 3);
     Serial.print("},\"gyro\":{\"x\":");
-    Serial.print(gx, 3);
+    Serial.print(values.gyroDpsX, 3);
     Serial.print(",\"y\":");
-    Serial.print(gy, 3);
+    Serial.print(values.gyroDpsY, 3);
     Serial.print(",\"z\":");
-    Serial.print(gz, 3);
+    Serial.print(values.gyroDpsZ, 3);
     Serial.print("},\"pitch\":");
     Serial.print(pitch, 2);
     Serial.print(",\"roll\":");
     Serial.print(roll, 2);
-    Serial.print(",\"yaw\":null");
+    Serial.print(",\"yaw\":");
+    Serial.print(yaw, 2);
   } else {
     Serial.print(",\"accel\":{\"x\":null,\"y\":null,\"z\":null}");
     Serial.print(",\"gyro\":{\"x\":null,\"y\":null,\"z\":null}");
@@ -927,14 +1385,65 @@ void printNullableDistanceMm(bool ok, uint8_t valid, uint16_t distanceMm) {
   }
 }
 
-void printKeyboardJson(const LatestKeyboard &snapshot, uint32_t nowMs) {
+void printKeyboardJson(const LatestKeyboard &snapshot,
+                       const LatestBatteryStatus &batterySnapshot,
+                       uint32_t nowMs) {
   bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
+  bool batteryKnown = batterySnapshot.seen;
+  bool batteryFresh = batteryKnown && (nowMs - batterySnapshot.received_ms <= BATTERY_STATUS_STALE_MS);
+  bool batteryValid = batteryFresh && batterySnapshot.packet.battery_valid != 0;
   Serial.print("\"keyboard\":{");
   Serial.print("\"status\":\"");
   Serial.print(ok ? "ok" : "not_connected");
   Serial.print("\",\"input\":\"");
   Serial.print(ok ? "tof" : "off");
-  Serial.print("\",\"battery_level\":null");
+  Serial.print("\",\"battery_level\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_percent);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"battery_voltage\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_mv / 1000.0f, 3);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"battery\":{\"status\":\"");
+  if (!batteryKnown) {
+    Serial.print("unknown");
+  } else if (!batteryFresh) {
+    Serial.print("stale");
+  } else if (!batteryValid) {
+    Serial.print("invalid");
+  } else {
+    Serial.print("ok");
+  }
+  Serial.print("\",\"percent\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_percent);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"voltage_v\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_mv / 1000.0f, 3);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"adc_raw\":");
+  if (batteryKnown) {
+    Serial.print(batterySnapshot.packet.battery_adc_raw);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"age_ms\":");
+  if (batteryKnown) {
+    Serial.print(nowMs - batterySnapshot.received_ms);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print("}");
   Serial.print(",\"sequence\":");
   if (ok) {
     Serial.print(snapshot.packet.header.sequence);
@@ -1216,12 +1725,63 @@ void printFutureDeviceJson(const char *name) {
   Serial.print("\":{\"status\":\"TBD\",\"input\":\"TBD\",\"battery_level\":null}");
 }
 
-void printAudioDockJson(const LatestAudioDock &snapshot, uint32_t nowMs) {
+void printAudioDockJson(const LatestAudioDock &snapshot,
+                        const LatestBatteryStatus &batterySnapshot,
+                        uint32_t nowMs) {
   bool ok = snapshot.seen && (nowMs - snapshot.received_ms <= DEVICE_TIMEOUT_MS);
+  bool batteryKnown = batterySnapshot.seen;
+  bool batteryFresh = batteryKnown && (nowMs - batterySnapshot.received_ms <= BATTERY_STATUS_STALE_MS);
+  bool batteryValid = batteryFresh && batterySnapshot.packet.battery_valid != 0;
   Serial.print("\"audiodock\":{");
   Serial.print("\"status\":\"");
   Serial.print(ok ? "ok" : "not_connected");
-  Serial.print("\",\"battery_level\":null");
+  Serial.print("\",\"battery_level\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_percent);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"battery_voltage\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_mv / 1000.0f, 3);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"battery\":{\"status\":\"");
+  if (!batteryKnown) {
+    Serial.print("unknown");
+  } else if (!batteryFresh) {
+    Serial.print("stale");
+  } else if (!batteryValid) {
+    Serial.print("invalid");
+  } else {
+    Serial.print("ok");
+  }
+  Serial.print("\",\"percent\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_percent);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"voltage_v\":");
+  if (batteryValid) {
+    Serial.print(batterySnapshot.packet.battery_mv / 1000.0f, 3);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"adc_raw\":");
+  if (batteryKnown) {
+    Serial.print(batterySnapshot.packet.battery_adc_raw);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print(",\"age_ms\":");
+  if (batteryKnown) {
+    Serial.print(nowMs - batterySnapshot.received_ms);
+  } else {
+    Serial.print("null");
+  }
+  Serial.print("}");
   Serial.print(",\"sequence\":");
   if (ok) {
     Serial.print(snapshot.packet.header.sequence);
@@ -1248,16 +1808,22 @@ void printAudioDockJson(const LatestAudioDock &snapshot, uint32_t nowMs) {
 void printJsonState() {
   LatestWristband wristSnapshot;
   LatestBatteryStatus wristBatterySnapshot;
+  LatestBatteryStatus keyboardBatterySnapshot;
+  LatestBatteryStatus audioDockBatterySnapshot;
   LatestCamDock camSnapshot;
   LatestFans fansSnapshot;
   LatestKeyboard keyboardSnapshot;
   LatestChargingDock chargingDockSnapshot;
   LatestAudioDock audiodockSnapshot;
+  WristbandCalibrationState wristCalSnapshot;
   uint32_t nowMs = millis();
 
   portENTER_CRITICAL(&stateMux);
   wristSnapshot = latestWristband;
+  wristCalSnapshot = wristCalState;
   wristBatterySnapshot = latestWristbandBattery;
+  keyboardBatterySnapshot = latestKeyboardBattery;
+  audioDockBatterySnapshot = latestAudioDockBattery;
   camSnapshot = latestCamDock;
   fansSnapshot = latestFans;
   keyboardSnapshot = latestKeyboard;
@@ -1281,15 +1847,15 @@ void printJsonState() {
     Serial.print("\"");
 
     Serial.print(",\"devices\":{");
-    printWristbandJson(wristSnapshot, wristBatterySnapshot, nowMs);
+    printWristbandJson(wristSnapshot, wristBatterySnapshot, wristCalSnapshot, nowMs);
     Serial.print(",");
     printCamDockJson(camSnapshot, nowMs);
     Serial.print(",");
-    printKeyboardJson(keyboardSnapshot, nowMs);
+    printKeyboardJson(keyboardSnapshot, keyboardBatterySnapshot, nowMs);
     Serial.print(",");
     printChargingDockJson(chargingDockSnapshot, nowMs);
     Serial.print(",");
-    printAudioDockJson(audiodockSnapshot, nowMs);
+    printAudioDockJson(audiodockSnapshot, audioDockBatterySnapshot, nowMs);
     Serial.print(",");
     printFansJson(fansSnapshot, nowMs);
     Serial.println("}}");
@@ -1302,6 +1868,7 @@ void setup() {
   Serial.setTxBufferSize(2048);
   Serial.begin(AIRTRIXX_SERIAL_BAUD);
   delay(200);
+  initAntennaStatusLed();
 
   // Initialize the thread-safe FreeRTOS Mutex for Serial operations
   serialMutex = xSemaphoreCreateMutex();
@@ -1363,9 +1930,31 @@ void loop() {
   pumpSerialCommands();
 
   uint32_t nowMs = millis();
-  
+  updateWristbandConnectionState(nowMs);
+
+  bool shouldFinalizeCalibration = false;
+  portENTER_CRITICAL(&stateMux);
+  if (wristCalState.calibrating &&
+      (nowMs - wristCalState.calibrateStartMs >= WRISTBAND_CALIBRATION_MS)) {
+    shouldFinalizeCalibration = true;
+  }
+  portEXIT_CRITICAL(&stateMux);
+  if (shouldFinalizeCalibration) {
+    finalizeWristbandCalibration();
+  }
+
   if (isStreamingAudioDock && (nowMs - lastAudioDockChunkMs >= AUDIODOCK_STREAM_TIMEOUT_MS)) {
     isStreamingAudioDock = false;
+  }
+
+  if (nowMs - lastAntennaStatusLedMs >= ANTENNA_STATUS_LED_INTERVAL_MS) {
+    lastAntennaStatusLedMs = nowMs;
+    updateAntennaStatusLed(nowMs);
+  }
+
+  if (!isStreamingAudioDock && (nowMs - lastAudioDockStatusMs >= AUDIODOCK_STATUS_INTERVAL_MS)) {
+    lastAudioDockStatusMs = nowMs;
+    sendAudioDockComponentStatus(nowMs);
   }
 
   const uint32_t intervalMs = 1000UL / ANTENNA_JSON_HZ;

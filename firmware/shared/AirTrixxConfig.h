@@ -41,6 +41,13 @@ static const uint8_t MUX_ADDR     = 0x70;
 static const uint8_t CH_LEFT_TOF  = 2;
 static const uint8_t CH_RIGHT_TOF = 1;
 
+// Keyboard battery divider: GND -> 22k -> ADC pin -> 22k -> LiPo positive.
+static const int KEYBOARD_BATTERY_ADC_PIN = 4;
+static const float KEYBOARD_BATTERY_DIVIDER_RATIO = 2.0f;
+static const float KEYBOARD_BATTERY_EMPTY_V = 3.30f;
+static const float KEYBOARD_BATTERY_FULL_V = 4.20f;
+static const uint32_t KEYBOARD_BATTERY_REPORT_MS = 20000;
+
 // PCA9685 servo channels.
 static const uint8_t CH_R_PAN    = 10;
 static const uint8_t CH_R_TILT   = 11;
@@ -131,6 +138,6 @@ static const uint16_t ANTENNA_JSON_HZ = 30;
 static const uint16_t CAMDOCK_REPORT_HZ = 30;
 static const uint16_t WRISTBAND_REPORT_HZ = 50;
 static const uint16_t FANS_REPORT_HZ = 2;
-static const uint16_t KEYBOARD_REPORT_HZ = 10;
+static const uint16_t KEYBOARD_REPORT_HZ = 30;
 static const uint16_t CHARGING_DOCK_REPORT_HZ = 2;
 static const uint32_t DEVICE_TIMEOUT_MS = 1000;

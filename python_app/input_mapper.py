@@ -19,6 +19,7 @@ ACTION_TYPES = {
     "keyboard_tap",
     "keyboard_hold",
     "keyboard_repeat",
+    "keyboard_text",
     "mouse_click",
     "mouse_hold",
     "mouse_scroll",
@@ -51,6 +52,16 @@ WRIST_GESTURE_SIGNAL_NAMES = {
     "fused.wrist_pitch_up_detected": "wrist_pitch_up",
     "fused.wrist_pitch_down_detected": "wrist_pitch_down",
     "fused.wrist_roll_right_then_neutral_detected": "wrist_roll_right_then_neutral",
+}
+TEXT_COMMAND_KEYS = {
+    "space": ["space"],
+    "return": ["enter"],
+    "enter": ["enter"],
+    "backspace": ["backspace"],
+    "backspase": ["backspace"],
+    "capslock": ["caps_lock"],
+    "capslook": ["caps_lock"],
+    "caps": ["caps_lock"],
 }
 
 
@@ -110,7 +121,33 @@ class SignalCatalog:
         keyboard_valid = keyboard.get("valid", {}) if isinstance(keyboard, dict) else {}
         add("Keyboard", "keyboard.status", "Status", keyboard.get("status") if isinstance(keyboard, dict) else None)
         add("Keyboard", "keyboard.input", "Input state", keyboard.get("input") if isinstance(keyboard, dict) else None)
+        add("Keyboard", "keyboard.predicted_word", "Predicted word", keyboard.get("predicted_word") if isinstance(keyboard, dict) else None)
+        add(
+            "Keyboard",
+            "keyboard.prediction_confidence",
+            "Prediction confidence",
+            keyboard.get("prediction_confidence") if isinstance(keyboard, dict) else None,
+        )
+        add(
+            "Keyboard",
+            "keyboard.prediction_sequence",
+            "Prediction sequence",
+            keyboard.get("prediction_sequence") if isinstance(keyboard, dict) else None,
+        )
+        add("Keyboard", "keyboard.model_loaded", "Model loaded", keyboard.get("model_loaded") if isinstance(keyboard, dict) else None)
+        add("Keyboard", "keyboard.training_status", "Training status", keyboard.get("training_status") if isinstance(keyboard, dict) else None)
         add("Keyboard", "keyboard.sequence", "Sequence", keyboard.get("sequence") if isinstance(keyboard, dict) else None)
+        top_matches = keyboard.get("top_matches") if isinstance(keyboard, dict) else None
+        if isinstance(top_matches, list):
+            for index, match in enumerate(top_matches[:3], start=1):
+                if isinstance(match, dict):
+                    add("Keyboard", f"keyboard.top_match_{index}", f"Top match {index}", match.get("word"))
+                    add(
+                        "Keyboard",
+                        f"keyboard.top_match_{index}_confidence",
+                        f"Top match {index} confidence",
+                        match.get("confidence"),
+                    )
         for index in range(1, 5):
             add(
                 "Keyboard",
@@ -169,8 +206,12 @@ class SignalCatalog:
 
         audiodock = devices.get("audiodock", {}) if isinstance(devices, dict) else {}
         add("Audio Dock", "audiodock.status", "Status", audiodock.get("status") if isinstance(audiodock, dict) else None)
+        add("Audio Dock", "audiodock.app_connected", "App connected", audiodock.get("app_connected") if isinstance(audiodock, dict) else None)
+        add("Audio Dock", "audiodock.input", "Input state", audiodock.get("input") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.clap_detected", "Clap detected", audiodock.get("clap_detected") if isinstance(audiodock, dict) else None)
         add("Audio Dock", "audiodock.clap_type", "Clap type", audiodock.get("clap_type") if isinstance(audiodock, dict) else None)
+        add("Audio Dock", "audiodock.last_trigger", "Last trigger", audiodock.get("last_trigger") if isinstance(audiodock, dict) else None)
+        add("Audio Dock", "audiodock.latest_transcript", "Latest transcript", audiodock.get("latest_transcript") if isinstance(audiodock, dict) else None)
 
         fans = devices.get("fans", {}) if isinstance(devices, dict) else {}
         fan_temps = fans.get("temps", {}) if isinstance(fans, dict) else {}
@@ -201,6 +242,9 @@ class MappingAction:
     button: str = "left"
     clicks: int = 1
     interval_ms: int = 250
+    text: str = ""
+    text_source: str = ""
+    append_space: bool = True
     scroll_x: int = 0
     scroll_y: int = 1
     speed_x: float = 0.0
@@ -226,6 +270,9 @@ class MappingAction:
         return cls(
             type=action_type,
             keys=parse_key_combo(data.get("keys", [])),
+            text=str(data.get("text") or ""),
+            text_source=str(data.get("text_source") or ""),
+            append_space=bool(data.get("append_space", True)),
             button=normalize_mouse_button(str(data.get("button", "left"))),
             clicks=max(1, int(float(data.get("clicks", 1) or 1))),
             interval_ms=max(20, int(float(data.get("interval_ms", 250) or 250))),
@@ -248,6 +295,9 @@ class MappingAction:
         return {
             "type": self.type,
             "keys": list(self.keys),
+            "text": self.text,
+            "text_source": self.text_source,
+            "append_space": self.append_space,
             "button": self.button,
             "clicks": self.clicks,
             "interval_ms": self.interval_ms,
@@ -272,11 +322,17 @@ class MappingAction:
             return "hold"
         if self.type in {"keyboard_repeat", "mouse_scroll"}:
             return "repeat"
+        if self.type == "keyboard_text":
+            return "text"
         if self.type == "mouse_move":
             return "continuous"
         return "tap"
 
     def summary(self) -> str:
+        if self.type == "keyboard_text":
+            source = self.text_source or "source"
+            suffix = " + space" if self.append_space else ""
+            return f"type {self.text or source}{suffix}"
         if self.type.startswith("keyboard"):
             combo = "+".join(self.keys) if self.keys else "(no keys)"
             if self.type == "keyboard_repeat":
@@ -774,7 +830,7 @@ class InputMapper:
         if action.type == "mouse_hold":
             self.backend.click_mouse(action.button, 1)
             return
-        self._execute_enter(MappingRule(id="__test__", name="Test action", action=action), action, time.monotonic())
+            self._execute_enter(MappingRule(id="__test__", name="Test action", action=action), action, time.monotonic())
 
     def state_for_rule(self, rule_id: str) -> _RuntimeState:
         return self._states.setdefault(rule_id, _RuntimeState())
@@ -817,7 +873,7 @@ class InputMapper:
             if state.enter_blocked:
                 state.status = "gesture cooldown"
                 return
-            self._execute_enter(rule, rule.action, now_s)
+            self._execute_enter(rule, rule.action, now_s, source_value, signals or {})
         elif not active and state.active:
             state.active = False
             state.last_process_s = None
@@ -845,7 +901,14 @@ class InputMapper:
             return True
         return False
 
-    def _execute_enter(self, rule: MappingRule, action: MappingAction, now_s: float) -> None:
+    def _execute_enter(
+        self,
+        rule: MappingRule,
+        action: MappingAction,
+        now_s: float,
+        source_value: Any = None,
+        signals: dict[str, SignalValue] | None = None,
+    ) -> None:
         rule_id = rule.id
         if action.type == "keyboard_tap":
             self.backend.tap_keys(action.keys)
@@ -853,6 +916,8 @@ class InputMapper:
             self._hold_keys(rule_id, action.keys)
         elif action.type == "keyboard_repeat":
             self.backend.tap_keys(action.keys)
+        elif action.type == "keyboard_text":
+            self._type_text_action(action, source_value, signals or {})
         elif action.type == "mouse_click":
             self.backend.click_mouse(action.button, action.clicks)
         elif action.type == "mouse_hold":
@@ -867,6 +932,29 @@ class InputMapper:
         if rule.recognition_label:
             self._last_recognition_label = rule.recognition_label
             self._last_recognition_s = now_s
+
+    def _type_text_action(
+        self,
+        action: MappingAction,
+        source_value: Any,
+        signals: dict[str, SignalValue],
+    ) -> None:
+        value: Any = action.text
+        if action.text_source:
+            signal = signals.get(action.text_source)
+            value = signal.value if signal is not None else ""
+        elif not value:
+            value = source_value
+        text = str(value or "")
+        if not text:
+            return
+        command_keys = TEXT_COMMAND_KEYS.get(text.strip().lower())
+        if command_keys:
+            self.backend.tap_keys(command_keys)
+            return
+        if action.append_space and not text.endswith((" ", "\n", "\t")):
+            text += " "
+        self.backend.type_text(text)
 
     def _sync_condition_outputs(
         self,

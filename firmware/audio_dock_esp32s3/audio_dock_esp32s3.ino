@@ -50,13 +50,28 @@
 #define RECORD_GAIN 32
 #define SPEAK_DELAY_MS 900
 #define CLAP_INFERENCE_GAIN 16
-#define CLAP_LABEL_THRESHOLD 0.35f
-#define CLAP_COMBINED_THRESHOLD 0.45f
+#define CLAP_LABEL_THRESHOLD 0.55f
+#define CLAP_SECONDARY_THRESHOLD 0.40f
+#define CLAP_NOISE_MARGIN 0.25f
+#define CLAP_AUDIO_PEAK_THRESHOLD 2500
+#define CLAP_PEAK_EVENT_THRESHOLD 2500
+#define CLAP_PEAK_EVENT_GAP_MS 120
+#define CLAP_PEAK_EVENT_GAP_SAMPLES ((SAMPLE_RATE * CLAP_PEAK_EVENT_GAP_MS) / 1000)
+#define CLAP_REARM_DELAY_MS 2000
+#define CLAP_INFERENCE_TIMEOUT_MS 4000
 #define PRINT_CLAP_SCORES true
 #define WAV_HEADER_BYTES 44
 #define AUDIO_DATA_BYTES (RECORD_SECONDS * SAMPLE_RATE * sizeof(int16_t))
 #define AUDIO_TOTAL_BYTES (WAV_HEADER_BYTES + AUDIO_DATA_BYTES)
+#define TRAINING_BATCH_MAX 20
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
+static const uint8_t BATTERY_ADC_PIN = 2;
+static const uint8_t BATTERY_ADC_SAMPLES = 8;
+static const float BATTERY_DIVIDER_RATIO = 147.0f / 47.0f;
+static const float BATTERY_EMPTY_V = 3.30f;
+static const float BATTERY_FULL_V = 4.20f;
+static const float BATTERY_VALID_MIN_V = 2.50f;
+static const uint32_t BATTERY_REPORT_INTERVAL_MS = 20UL * 1000UL;
 
 // -------------------- SD card pins --------------------
 #define SD_CS_PIN 47
@@ -65,6 +80,8 @@ static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 #define SD_MOSI_PIN 39
 #define SD_SPI_HZ 4000000
 static const char *AUDIO_WAV_PATH = "/AIRDCK.WAV";
+static char trainingBatchPaths[TRAINING_BATCH_MAX][24];
+static uint32_t trainingBatchSizes[TRAINING_BATCH_MAX];
 
 // -------------------- MAX98357A I2S speaker --------------------
 #define SPEAKER_BCLK_PIN 21
@@ -83,6 +100,10 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define LED_RING_PIN 15
 #define LED_RING_COUNT 16
 #define LED_RING_BRIGHTNESS 32
+#define LED_RING_STATUS_SEGMENTS 8
+#define COMPONENT_STATUS_SEGMENTS 6
+#define COMPONENT_STATUS_STALE_MS 2000
+#define AUDIODOCK_HEARTBEAT_INTERVAL_MS 500
 Adafruit_NeoPixel ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
 
 bool i2sReady = false;
@@ -108,7 +129,11 @@ static const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x
 static int16_t sampleBuffer[sample_buffer_size];
 static int32_t inferenceRawBuffer[sample_buffer_size];
 static uint32_t inferenceWindowPeak = 0;
+static uint16_t inferenceWindowPeakEvents = 0;
+static uint32_t inferenceWindowSampleIndex = 0;
+static uint32_t inferenceWindowLastPeakSample = 0;
 static volatile uint32_t lastInferencePeak = 0;
+static volatile uint16_t lastInferencePeakEvents = 0;
 static bool debug_nn = false;
 static bool record_status = true;
 static volatile bool taskRunning = false;
@@ -121,10 +146,18 @@ void ringFlash(uint8_t r, uint8_t g, uint8_t b, uint8_t flashes, uint16_t onMs, 
 void ringShowReady();
 void ringShowSuccess();
 void ringShowError();
+bool ringShowComponentStatus();
+void ringShowIdleStatus(uint16_t step);
 void runLedRingSelfTest();
 void disableOnboardLed();
 void playTranscriptionDoneSound();
 void runSpeakerSelfTest();
+bool handleComponentStatusText(const String &incoming);
+bool sendAudioDockHeartbeat();
+void pumpAudioDockHeartbeat();
+void pumpAudioDockBatteryStatus();
+bool consumeTrainingRecordRequest();
+bool consumeTrainingBatchRequest(uint8_t *count);
 
 // State machine states
 enum AudioDockState {
@@ -132,6 +165,8 @@ enum AudioDockState {
   STATE_WAIT_CLAP,
   STATE_RECORDING,
   STATE_STREAMING,
+  STATE_TRAINING_BATCH_RECORD,
+  STATE_TRAINING_BATCH_STREAM,
   STATE_WAIT_TRANSCRIPT
 };
 static AudioDockState currentState = STATE_INIT;
@@ -139,7 +174,17 @@ static String lastTranscriptText = "";
 static String lastRemoteCommandText = "";
 static uint32_t lastRemoteCommandMs = 0;
 static bool transcriptReceived = false;
+static volatile bool trainingRecordRequested = false;
+static volatile uint8_t trainingBatchRequestedCount = 0;
+static uint8_t activeTrainingBatchCount = 0;
+static uint8_t activeTrainingBatchIndex = 0;
 static uint32_t transcriptWaitStartMs = 0;
+static uint32_t nextClapArmMs = 0;
+static uint8_t componentStatusMask = 0;
+static bool componentStatusKnown = false;
+static uint32_t lastComponentStatusMs = 0;
+static uint32_t lastAudioDockHeartbeatMs = 0;
+static uint32_t lastBatteryReportMs = 0;
 static const uint32_t TRANSCRIPT_TIMEOUT_MS = 30000;
 
 // -------------------- LED Ring Helper Functions --------------------
@@ -195,8 +240,49 @@ void ringFlash(uint8_t r, uint8_t g, uint8_t b, uint8_t flashes, uint16_t onMs, 
   }
 }
 
+void ringSetStatusSegment(uint8_t segment, uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t ledsPerSegment = LED_RING_COUNT / LED_RING_STATUS_SEGMENTS;
+  uint8_t start = segment * ledsPerSegment;
+  for (uint8_t offset = 0; offset < ledsPerSegment; offset++) {
+    uint8_t pixel = start + offset;
+    if (pixel < LED_RING_COUNT) {
+      ledRing.setPixelColor(pixel, ledRing.Color(r, g, b));
+    }
+  }
+}
+
+bool ringShowComponentStatus() {
+  if (!componentStatusKnown || millis() - lastComponentStatusMs > COMPONENT_STATUS_STALE_MS) {
+    return false;
+  }
+
+  ledRing.clear();
+  for (uint8_t segment = 0; segment < LED_RING_STATUS_SEGMENTS; segment++) {
+    if (segment < COMPONENT_STATUS_SEGMENTS) {
+      bool connected = (componentStatusMask & (1 << segment)) != 0;
+      if (connected) {
+        ringSetStatusSegment(segment, 0, 48, 0);
+      } else {
+        ringSetStatusSegment(segment, 64, 0, 0);
+      }
+    } else {
+      ringSetStatusSegment(segment, 0, 0, 5);
+    }
+  }
+  ledRing.show();
+  return true;
+}
+
+void ringShowIdleStatus(uint16_t step) {
+  if (!ringShowComponentStatus()) {
+    ringChase(0, 0, 80, step);
+  }
+}
+
 void ringShowReady() {
-  ringFill(0, 0, 24);
+  if (!ringShowComponentStatus()) {
+    ringFill(0, 0, 24);
+  }
 }
 
 void ringShowSuccess() {
@@ -416,7 +502,15 @@ void flushI2S() {
   }
 }
 
+void resetMicI2SDriver() {
+  i2s_driver_uninstall(I2S_PORT);
+  i2sReady = false;
+  delay(20);
+}
+
 bool initI2SMic() {
+  resetMicI2SDriver();
+
   i2s_config_t i2sConfig = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
@@ -440,11 +534,14 @@ bool initI2SMic() {
 
   esp_err_t err = i2s_driver_install(I2S_PORT, &i2sConfig, 0, NULL);
   if (err != ESP_OK) {
+    Serial.printf("I2S record driver install failed: %d\n", err);
     return false;
   }
 
   err = i2s_set_pin(I2S_PORT, &pinConfig);
   if (err != ESP_OK) {
+    Serial.printf("I2S record pin setup failed: %d\n", err);
+    resetMicI2SDriver();
     return false;
   }
 
@@ -590,7 +687,7 @@ bool recordWavToMemory(uint32_t *wavBytes) {
   return true;
 }
 
-bool recordWavToSD(uint32_t *wavBytes) {
+bool recordWavToSDPath(const char *wavPath, uint32_t *wavBytes) {
   lastRecordError = "";
   if (!initSDCard()) {
     lastRecordError = "SD not ready";
@@ -602,11 +699,11 @@ bool recordWavToSD(uint32_t *wavBytes) {
     return false;
   }
 
-  if (SD.exists(AUDIO_WAV_PATH)) {
-    SD.remove(AUDIO_WAV_PATH);
+  if (SD.exists(wavPath)) {
+    SD.remove(wavPath);
   }
 
-  File file = SD.open(AUDIO_WAV_PATH, FILE_WRITE);
+  File file = SD.open(wavPath, FILE_WRITE);
   if (!file) {
     lastRecordError = "SD open failed";
     Serial.println("Failed to open SD WAV file for writing.");
@@ -630,7 +727,7 @@ bool recordWavToSD(uint32_t *wavBytes) {
   displayLCDStatus("Recording...", "Speak now!");
   Serial.printf("SD_RECORD_START seconds=%u path=%s\n",
                 (unsigned int)RECORD_SECONDS,
-                AUDIO_WAV_PATH);
+                wavPath);
 
   uint32_t startedAt = millis();
   uint32_t samplesWritten = 0;
@@ -694,8 +791,12 @@ bool recordWavToSD(uint32_t *wavBytes) {
   Serial.printf("SD_RECORD_DONE ms=%lu wav_bytes=%u path=%s\n",
                 (unsigned long)(millis() - startedAt),
                 (unsigned int)*wavBytes,
-                AUDIO_WAV_PATH);
+                wavPath);
   return true;
+}
+
+bool recordWavToSD(uint32_t *wavBytes) {
+  return recordWavToSDPath(AUDIO_WAV_PATH, wavBytes);
 }
 
 // -------------------- LCD UI Display Helper Functions --------------------
@@ -737,15 +838,26 @@ static void audio_inference_callback(uint32_t samplesRead) {
   for (uint32_t i = 0; i < samplesRead; i++) {
     int32_t value = sampleBuffer[i];
     uint32_t magnitude = value < 0 ? (uint32_t)(-value) : (uint32_t)value;
+    uint32_t sampleIndex = inferenceWindowSampleIndex++;
     if (magnitude > inferenceWindowPeak) {
       inferenceWindowPeak = magnitude;
+    }
+    if (magnitude >= CLAP_PEAK_EVENT_THRESHOLD &&
+        (inferenceWindowPeakEvents == 0 ||
+         sampleIndex - inferenceWindowLastPeakSample >= CLAP_PEAK_EVENT_GAP_SAMPLES)) {
+      inferenceWindowPeakEvents++;
+      inferenceWindowLastPeakSample = sampleIndex;
     }
 
     inference.buffer[inference.buf_count++] = sampleBuffer[i];
 
     if (inference.buf_count >= inference.n_samples) {
       lastInferencePeak = inferenceWindowPeak;
+      lastInferencePeakEvents = inferenceWindowPeakEvents;
       inferenceWindowPeak = 0;
+      inferenceWindowPeakEvents = 0;
+      inferenceWindowSampleIndex = 0;
+      inferenceWindowLastPeakSample = 0;
       inference.buf_count = 0;
       inference.buf_ready = 1;
       break;
@@ -784,7 +896,7 @@ static void capture_samples(void* arg) {
       if (record_status && inference.buf_ready == 0) {
         audio_inference_callback(samplesRead);
       } else {
-        break;
+        delay(5);
       }
     }
   }
@@ -793,6 +905,8 @@ static void capture_samples(void* arg) {
 }
 
 static int ei_i2s_init(uint32_t sampling_rate) {
+  resetMicI2SDriver();
+
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = sampling_rate,
@@ -815,18 +929,27 @@ static int ei_i2s_init(uint32_t sampling_rate) {
   };
 
   esp_err_t ret = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  if (ret != ESP_OK) return int(ret);
+  if (ret != ESP_OK) {
+    Serial.printf("I2S inference driver install failed: %d\n", ret);
+    return int(ret);
+  }
 
   ret = i2s_set_pin(I2S_PORT, &pin_config);
-  if (ret != ESP_OK) return int(ret);
+  if (ret != ESP_OK) {
+    Serial.printf("I2S inference pin setup failed: %d\n", ret);
+    resetMicI2SDriver();
+    return int(ret);
+  }
 
   ret = i2s_zero_dma_buffer(I2S_PORT);
+  if (ret == ESP_OK) {
+    i2sReady = true;
+  }
   return int(ret);
 }
 
 static int ei_i2s_deinit(void) {
-  i2s_driver_uninstall(I2S_PORT);
-  i2sReady = false;
+  resetMicI2SDriver();
   return 0;
 }
 
@@ -839,6 +962,12 @@ static bool microphone_inference_start(uint32_t n_samples) {
   inference.buf_count  = 0;
   inference.n_samples  = n_samples;
   inference.buf_ready  = 0;
+  inferenceWindowPeak = 0;
+  inferenceWindowPeakEvents = 0;
+  inferenceWindowSampleIndex = 0;
+  inferenceWindowLastPeakSample = 0;
+  lastInferencePeak = 0;
+  lastInferencePeakEvents = 0;
 
   if (ei_i2s_init(EI_CLASSIFIER_FREQUENCY) != 0) {
     Serial.println("Failed to start I2S for Edge Impulse!");
@@ -849,12 +978,28 @@ static bool microphone_inference_start(uint32_t n_samples) {
 
   delay(100);
   record_status = true;
-  xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void*)sample_buffer_size, 10, NULL);
+  taskRunning = false;
+  BaseType_t taskCreated = xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void*)sample_buffer_size, 10, NULL);
+  if (taskCreated != pdPASS) {
+    Serial.println("Failed to start clap capture task.");
+    record_status = false;
+    ei_i2s_deinit();
+    free(inference.buffer);
+    inference.buffer = nullptr;
+    return false;
+  }
   return true;
 }
 
 static bool microphone_inference_record(void) {
+  uint32_t startedAt = millis();
   while (inference.buf_ready == 0) {
+    if (!taskRunning && millis() - startedAt > 200) {
+      return false;
+    }
+    if (millis() - startedAt > CLAP_INFERENCE_TIMEOUT_MS) {
+      return false;
+    }
     delay(10);
   }
   inference.buf_ready = 0;
@@ -909,6 +1054,20 @@ bool addEspNowPeer(const uint8_t mac[6]) {
   return (esp_now_add_peer(&peer) == ESP_OK);
 }
 
+bool handleComponentStatusText(const String &incoming) {
+  static const char *prefix = "__STATUS:";
+  if (!incoming.startsWith(prefix)) {
+    return false;
+  }
+
+  String hexMask = incoming.substring(strlen(prefix));
+  hexMask.trim();
+  componentStatusMask = (uint8_t)(strtoul(hexMask.c_str(), nullptr, 16) & 0x3F);
+  componentStatusKnown = true;
+  lastComponentStatusMs = millis();
+  return true;
+}
+
 void handleIncomingPacket(const uint8_t *data, int len) {
   if (len < static_cast<int>(sizeof(AirTrixxPacketHeader))) {
     return;
@@ -925,6 +1084,9 @@ void handleIncomingPacket(const uint8_t *data, int len) {
 
     String incoming = String(packet.transcript);
     incoming.trim();
+    if (handleComponentStatusText(incoming)) {
+      return;
+    }
     if (incoming == "__CMD:LEDTEST__") {
       if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
         return;
@@ -945,10 +1107,61 @@ void handleIncomingPacket(const uint8_t *data, int len) {
       displayLCDStatus("System Ready", "Clap to speak!");
       return;
     }
+    if (incoming == "__CMD:TRAINING_RECORD__") {
+      if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
+        return;
+      }
+      lastRemoteCommandText = incoming;
+      lastRemoteCommandMs = millis();
+      trainingRecordRequested = true;
+      displayLCDStatus("Training Mode", "Recording...");
+      return;
+    }
+    if (incoming.startsWith("__CMD:TRAINING_BATCH:")) {
+      if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
+        return;
+      }
+      int valueStart = String("__CMD:TRAINING_BATCH:").length();
+      int valueEnd = incoming.indexOf("__", valueStart);
+      if (valueEnd < 0) {
+        valueEnd = incoming.length();
+      }
+      int requestedCount = incoming.substring(valueStart, valueEnd).toInt();
+      if (requestedCount < 1) {
+        requestedCount = 1;
+      }
+      if (requestedCount > TRAINING_BATCH_MAX) {
+        requestedCount = TRAINING_BATCH_MAX;
+      }
+      lastRemoteCommandText = incoming;
+      lastRemoteCommandMs = millis();
+      trainingBatchRequestedCount = (uint8_t)requestedCount;
+      displayLCDStatus("Training Batch", String(requestedCount) + " samples");
+      return;
+    }
 
     lastTranscriptText = incoming;
     transcriptReceived = true;
   }
+}
+
+bool consumeTrainingRecordRequest() {
+  if (!trainingRecordRequested) {
+    return false;
+  }
+  trainingRecordRequested = false;
+  return true;
+}
+
+bool consumeTrainingBatchRequest(uint8_t *count) {
+  if (trainingBatchRequestedCount == 0) {
+    return false;
+  }
+  if (count != nullptr) {
+    *count = trainingBatchRequestedCount;
+  }
+  trainingBatchRequestedCount = 0;
+  return true;
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -974,6 +1187,87 @@ bool sendEspNowToAntenna(const uint8_t *data, size_t len, uint8_t retries = 10) 
   }
   Serial.printf("ESP-NOW send failed: %d\n", result);
   return false;
+}
+
+bool sendAudioDockHeartbeat() {
+  HeartbeatPacket packet = {};
+  fillHeader(packet.header,
+             MSG_HEARTBEAT,
+             DEVICE_AUDIODOCK,
+             ++audioDockSequence,
+             millis(),
+             false);
+  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet), 0);
+}
+
+uint8_t audioDockBatteryPercentFromVoltage(float voltage) {
+  if (voltage <= BATTERY_EMPTY_V) {
+    return 0;
+  }
+  if (voltage >= BATTERY_FULL_V) {
+    return 100;
+  }
+  return static_cast<uint8_t>(lroundf(100.0f * (voltage - BATTERY_EMPTY_V) /
+                                      (BATTERY_FULL_V - BATTERY_EMPTY_V)));
+}
+
+bool readAudioDockBattery(float &batteryVoltage, uint8_t &batteryPercent, uint16_t &batteryAdcRaw) {
+  uint32_t rawSum = 0;
+  uint32_t mvSum = 0;
+  for (uint8_t i = 0; i < BATTERY_ADC_SAMPLES; i++) {
+    rawSum += analogRead(BATTERY_ADC_PIN);
+    mvSum += analogReadMilliVolts(BATTERY_ADC_PIN);
+    delayMicroseconds(200);
+  }
+
+  batteryAdcRaw = rawSum / BATTERY_ADC_SAMPLES;
+  float pinVoltage = (static_cast<float>(mvSum) / BATTERY_ADC_SAMPLES) / 1000.0f;
+  batteryVoltage = pinVoltage * BATTERY_DIVIDER_RATIO;
+  if (batteryVoltage < BATTERY_VALID_MIN_V) {
+    batteryPercent = 0;
+    return false;
+  }
+  batteryPercent = audioDockBatteryPercentFromVoltage(batteryVoltage);
+  return true;
+}
+
+void sendAudioDockBatteryStatus() {
+  float batteryVoltage = 0.0f;
+  uint8_t batteryPercent = 0;
+  uint16_t batteryAdcRaw = 0;
+  bool batteryValid = readAudioDockBattery(batteryVoltage, batteryPercent, batteryAdcRaw);
+
+  BatteryStatusPacket packet = {};
+  fillHeader(packet.header,
+             MSG_BATTERY_STATUS,
+             DEVICE_AUDIODOCK,
+             ++audioDockSequence,
+             millis(),
+             false);
+  packet.battery_mv = batteryValid ? static_cast<uint16_t>(lroundf(batteryVoltage * 1000.0f)) : 0;
+  packet.battery_percent = batteryValid ? batteryPercent : 0;
+  packet.battery_valid = batteryValid ? 1 : 0;
+  packet.battery_adc_raw = batteryAdcRaw;
+
+  sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet), 2);
+}
+
+void pumpAudioDockHeartbeat() {
+  uint32_t nowMs = millis();
+  if (nowMs - lastAudioDockHeartbeatMs < AUDIODOCK_HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+  lastAudioDockHeartbeatMs = nowMs;
+  sendAudioDockHeartbeat();
+}
+
+void pumpAudioDockBatteryStatus() {
+  uint32_t nowMs = millis();
+  if (lastBatteryReportMs != 0 && nowMs - lastBatteryReportMs < BATTERY_REPORT_INTERVAL_MS) {
+    return;
+  }
+  lastBatteryReportMs = nowMs;
+  sendAudioDockBatteryStatus();
 }
 
 bool sendAudioDockTrigger(uint8_t triggerType, uint32_t audioSize) {
@@ -1094,13 +1388,13 @@ bool recordAndStreamWavToAntenna(uint8_t triggerType, uint32_t *wavBytes) {
   return true;
 }
 
-bool streamWavFileToAntenna(uint8_t triggerType, uint32_t wavBytes) {
+bool streamWavFilePathToAntenna(const char *wavPath, uint8_t triggerType, uint32_t wavBytes) {
   if (!sdReady && !initSDCard()) {
     lastRecordError = "SD not ready";
     return false;
   }
 
-  File file = SD.open(AUDIO_WAV_PATH, FILE_READ);
+  File file = SD.open(wavPath, FILE_READ);
   if (!file) {
     lastRecordError = "SD read failed";
     Serial.println("Failed to open SD WAV file for reading.");
@@ -1121,7 +1415,7 @@ bool streamWavFileToAntenna(uint8_t triggerType, uint32_t wavBytes) {
 
   Serial.printf("SD_STREAM_START bytes=%u path=%s\n",
                 (unsigned int)wavBytes,
-                AUDIO_WAV_PATH);
+                wavPath);
 
   uint8_t chunk[200];
   uint32_t sentBytes = 0;
@@ -1161,6 +1455,10 @@ bool streamWavFileToAntenna(uint8_t triggerType, uint32_t wavBytes) {
   return sentBytes >= wavBytes;
 }
 
+bool streamWavFileToAntenna(uint8_t triggerType, uint32_t wavBytes) {
+  return streamWavFilePathToAntenna(AUDIO_WAV_PATH, triggerType, wavBytes);
+}
+
 void handleLocalSerialCommand(String command) {
   command.trim();
   command.toUpperCase();
@@ -1196,6 +1494,9 @@ void setup() {
   ringClear();
   ringShowReady();
   disableOnboardLed();
+  pinMode(BATTERY_ADC_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
 
   // Initialize LCD Screen
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1249,16 +1550,48 @@ void setup() {
 
 void loop() {
   pollLocalSerialCommands();
+  pumpAudioDockBatteryStatus();
+  if (currentState == STATE_WAIT_CLAP || currentState == STATE_WAIT_TRANSCRIPT) {
+    pumpAudioDockHeartbeat();
+  }
 
   switch (currentState) {
     case STATE_WAIT_CLAP: {
+      uint32_t nowMs = millis();
+      uint8_t requestedBatchCount = 0;
+      if (consumeTrainingBatchRequest(&requestedBatchCount)) {
+        activeTrainingBatchCount = requestedBatchCount;
+        activeTrainingBatchIndex = 0;
+        pendingTriggerType = 0;
+        displayLCDStatus("Training Batch", String(activeTrainingBatchCount) + " samples");
+        currentState = STATE_TRAINING_BATCH_RECORD;
+        break;
+      }
+
+      if (consumeTrainingRecordRequest()) {
+        pendingTriggerType = 0;
+        displayLCDStatus("Training sample", "Recording...");
+        currentState = STATE_RECORDING;
+        break;
+      }
+
+      if (nextClapArmMs != 0 && (int32_t)(nextClapArmMs - nowMs) > 0) {
+        pumpAudioDockBatteryStatus();
+        pumpAudioDockHeartbeat();
+        displayLCDStatus("Cooling down", "Clap soon");
+        ringShowComponentStatus();
+        delay(100);
+        break;
+      }
+      nextClapArmMs = 0;
+
       uint8_t mac[6] = {};
       WiFi.macAddress(mac);
       char macLcd[18];
       snprintf(macLcd, sizeof(macLcd), "MAC:%02X%02X%02X%02X%02X%02X",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       displayLCDStatus("Clap to speak!", macLcd);
-      ringChase(0, 0, 80, 0);
+      ringShowIdleStatus(0);
       
       if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
         displayLCDStatus("Inference Err", "Memory failed");
@@ -1268,16 +1601,33 @@ void loop() {
       }
 
       bool clapDetected = false;
+      bool detectorFault = false;
+      bool manualRecordRequested = false;
+      bool manualBatchRequested = false;
       uint8_t triggerType = 0; // 1 = Single, 2 = Double
       uint16_t listeningStep = 0;
 
       while (!clapDetected) {
         pollLocalSerialCommands();
-        ringChase(0, 0, 80, listeningStep++);
+        pumpAudioDockBatteryStatus();
+        pumpAudioDockHeartbeat();
+        ringShowIdleStatus(listeningStep++);
+        if (consumeTrainingRecordRequest()) {
+          manualRecordRequested = true;
+          break;
+        }
+        if (consumeTrainingBatchRequest(&requestedBatchCount)) {
+          activeTrainingBatchCount = requestedBatchCount;
+          activeTrainingBatchIndex = 0;
+          manualBatchRequested = true;
+          break;
+        }
 
         bool m = microphone_inference_record();
         if (!m) {
-          continue;
+          Serial.println("Clap inference capture stalled; restarting detector.");
+          detectorFault = true;
+          break;
         }
 
         signal_t signal;
@@ -1322,35 +1672,78 @@ void loop() {
           }
         }
 
-        float combinedClapScore = singleClapScore + doubleClapScore;
-        bool bestIsClap = bestLabel.equalsIgnoreCase("Single clap") || bestLabel.equalsIgnoreCase("Double clap");
-        bool strongSingleOrDouble = singleClapScore >= CLAP_LABEL_THRESHOLD || doubleClapScore >= CLAP_LABEL_THRESHOLD;
-        bool combinedClapWins = combinedClapScore >= CLAP_COMBINED_THRESHOLD && combinedClapScore > noiseScore;
+        uint32_t peak = lastInferencePeak;
+        uint16_t peakEvents = lastInferencePeakEvents;
+        bool bestIsSingleClap = bestLabel.equalsIgnoreCase("Single clap");
+        bool bestIsDoubleClap = bestLabel.equalsIgnoreCase("Double clap");
+        float triggerScore = doubleClapScore > singleClapScore ? doubleClapScore : singleClapScore;
+        bool clapStrong = triggerScore >= CLAP_LABEL_THRESHOLD;
+        bool clapBeatsNoise = triggerScore >= noiseScore + CLAP_NOISE_MARGIN;
+        bool peakIsAudible = peak >= CLAP_AUDIO_PEAK_THRESHOLD;
+        bool enoughPeakEvents = bestIsDoubleClap ? peakEvents >= 2 : peakEvents >= 1;
+        bool multiPeakClap = triggerScore >= CLAP_SECONDARY_THRESHOLD &&
+                             peakEvents >= 2 &&
+                             peak >= 8000;
+        bool modelClap = (bestIsSingleClap || bestIsDoubleClap) &&
+                         clapStrong &&
+                         clapBeatsNoise &&
+                         peakIsAudible &&
+                         enoughPeakEvents;
+        bool clapAccepted = modelClap || multiPeakClap;
 
         if (PRINT_CLAP_SCORES) {
-          uint32_t peak = lastInferencePeak;
-          Serial.printf(" combined=%.2f best=%s %.2f peak=%lu\n",
-                        combinedClapScore,
+          Serial.printf(" best=%s %.2f peak=%lu peak_events=%u clap_ok=%u noise_margin=%u multipk=%u\n",
                         bestLabel.c_str(),
                         bestScore,
-                        (unsigned long)peak);
+                        (unsigned long)peak,
+                        (unsigned int)peakEvents,
+                        (unsigned int)clapAccepted,
+                        (unsigned int)clapBeatsNoise,
+                        (unsigned int)multiPeakClap);
         }
 
-        if ((bestIsClap && strongSingleOrDouble) || combinedClapWins) {
+        if (clapAccepted) {
           triggerType = doubleClapScore > singleClapScore ? 2 : 1;
           const char *triggerLabel = triggerType == 2 ? "Double clap" : "Single clap";
-          float triggerScore = triggerType == 2 ? doubleClapScore : singleClapScore;
-          Serial.printf("Triggered! Detected: %s score=%.2f combined=%.2f noise=%.2f\n",
+          Serial.printf("Triggered! Detected: %s score=%.2f single=%.2f double=%.2f noise=%.2f peak=%lu peak_events=%u multipk=%u\n",
                         triggerLabel,
                         triggerScore,
-                        combinedClapScore,
-                        noiseScore);
+                        singleClapScore,
+                        doubleClapScore,
+                        noiseScore,
+                        (unsigned long)peak,
+                        (unsigned int)peakEvents,
+                        (unsigned int)multiPeakClap);
           clapDetected = true;
         }
       }
 
-      // Clap detected! Stop model classification
       microphone_inference_end();
+
+      if (manualBatchRequested) {
+        pendingTriggerType = 0;
+        displayLCDStatus("Training Batch", String(activeTrainingBatchCount) + " samples");
+        currentState = STATE_TRAINING_BATCH_RECORD;
+        break;
+      }
+
+      if (manualRecordRequested) {
+        pendingTriggerType = 0;
+        displayLCDStatus("Training sample", "Recording...");
+        currentState = STATE_RECORDING;
+        break;
+      }
+
+      if (detectorFault || !clapDetected) {
+        displayLCDStatus("Mic restarting", "Clap again");
+        ringShowError();
+        nextClapArmMs = millis() + 500;
+        currentState = STATE_WAIT_CLAP;
+        delay(500);
+        break;
+      }
+
+      // Clap detected! Stop model classification
       displayLCDStatus("Clap Detected!", "Speak now...");
       ringFlash(0, 64, 0, 2, 120, 80);
       delay(250);
@@ -1361,12 +1754,17 @@ void loop() {
     }
 
     case STATE_RECORDING: {
-      displayLCDStatus("Record+Send", "Listening...");
+      if (pendingTriggerType == 0) {
+        displayLCDStatus("Training sample", "Listening...");
+      } else {
+        displayLCDStatus("Record+Send", "Listening...");
+      }
       
       if (!initI2SMic()) {
         displayLCDStatus("Mic Error", "Failed to start");
         ringShowError();
         delay(2000);
+        nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
         currentState = STATE_WAIT_CLAP;
         break;
       }
@@ -1374,15 +1772,15 @@ void loop() {
       uint32_t wavSize = 0;
       bool recordedOk = recordWavToSD(&wavSize);
       
-      // Uninstall microphone I2S driver
-      i2s_driver_uninstall(I2S_PORT);
-      i2sReady = false;
+      // Uninstall microphone I2S driver before returning to clap inference.
+      resetMicI2SDriver();
 
       if (!recordedOk) {
         String errorLine = lastRecordError.length() > 0 ? lastRecordError : "Failed saving";
         displayLCDStatus("Record Error", errorLine.substring(0, 16));
         ringShowError();
         delay(2000);
+        nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
         currentState = STATE_WAIT_CLAP;
         break;
       }
@@ -1399,6 +1797,7 @@ void loop() {
         displayLCDStatus("Send Error", errorLine.substring(0, 16));
         ringShowError();
         delay(2000);
+        nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
         currentState = STATE_WAIT_CLAP;
         break;
       }
@@ -1409,6 +1808,81 @@ void loop() {
       break;
     }
 
+    case STATE_TRAINING_BATCH_RECORD: {
+      if (activeTrainingBatchCount == 0) {
+        currentState = STATE_WAIT_CLAP;
+        break;
+      }
+
+      if (!initI2SMic()) {
+        displayLCDStatus("Mic Error", "Failed to start");
+        ringShowError();
+        delay(2000);
+        nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
+        currentState = STATE_WAIT_CLAP;
+        break;
+      }
+
+      bool batchOk = true;
+      for (uint8_t i = 0; i < activeTrainingBatchCount; i++) {
+        snprintf(trainingBatchPaths[i], sizeof(trainingBatchPaths[i]), "/TRN_%03u.WAV", (unsigned int)(i + 1));
+        trainingBatchSizes[i] = 0;
+        displayLCDStatus("Batch Rec", String(i + 1) + "/" + String(activeTrainingBatchCount));
+        if (!recordWavToSDPath(trainingBatchPaths[i], &trainingBatchSizes[i])) {
+          batchOk = false;
+          break;
+        }
+        delay(250);
+      }
+
+      resetMicI2SDriver();
+
+      if (!batchOk) {
+        String errorLine = lastRecordError.length() > 0 ? lastRecordError : "Batch failed";
+        displayLCDStatus("Batch Error", errorLine.substring(0, 16));
+        ringShowError();
+        delay(2000);
+        nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
+        currentState = STATE_WAIT_CLAP;
+        break;
+      }
+
+      activeTrainingBatchIndex = 0;
+      displayLCDStatus("Batch Upload", String(activeTrainingBatchCount) + " samples");
+      currentState = STATE_TRAINING_BATCH_STREAM;
+      break;
+    }
+
+    case STATE_TRAINING_BATCH_STREAM: {
+      bool batchStreamOk = true;
+      while (activeTrainingBatchIndex < activeTrainingBatchCount) {
+        displayLCDStatus("Uploading", String(activeTrainingBatchIndex + 1) + "/" + String(activeTrainingBatchCount));
+        if (!streamWavFilePathToAntenna(trainingBatchPaths[activeTrainingBatchIndex], 0, trainingBatchSizes[activeTrainingBatchIndex])) {
+          batchStreamOk = false;
+          break;
+        }
+        activeTrainingBatchIndex++;
+        delay(250);
+      }
+
+      if (!batchStreamOk) {
+        String errorLine = lastRecordError.length() > 0 ? lastRecordError : "Upload failed";
+        displayLCDStatus("Batch Upload Err", errorLine.substring(0, 16));
+        ringShowError();
+        delay(2000);
+      } else {
+        displayLCDStatus("Batch Done", String(activeTrainingBatchCount) + " uploaded");
+        ringShowSuccess();
+        delay(1500);
+      }
+
+      activeTrainingBatchCount = 0;
+      activeTrainingBatchIndex = 0;
+      nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
+      currentState = STATE_WAIT_CLAP;
+      break;
+    }
+
     case STATE_WAIT_TRANSCRIPT: {
       displayLCDStatus("Status: Wait...", "Transcribing...");
       uint16_t waitStep = 0;
@@ -1416,6 +1890,8 @@ void loop() {
       
       while (!transcriptReceived && (millis() - transcriptWaitStartMs < TRANSCRIPT_TIMEOUT_MS)) {
         pollLocalSerialCommands();
+        pumpAudioDockBatteryStatus();
+        pumpAudioDockHeartbeat();
         if (millis() - lastRingUpdate >= 100) {
           ringChase(64, 0, 80, waitStep++);
           lastRingUpdate = millis();
@@ -1435,6 +1911,7 @@ void loop() {
       }
 
       ringShowReady();
+      nextClapArmMs = millis() + CLAP_REARM_DELAY_MS;
       currentState = STATE_WAIT_CLAP;
       break;
     }

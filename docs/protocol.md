@@ -94,6 +94,13 @@ Scaling:
 - `gyro_mdps_*`: millidegrees/second. Convert to deg/s with `value * 0.001`.
 - `pitch_cdeg`, `roll_cdeg`: centidegrees. Convert to degrees with `value * 0.01`.
 
+The Antenna integrates `gyro_mdps_z` into a session `yaw` value and applies a
+2-second zero-point calibration to pitch, roll, yaw, and accel `x`/`y`/`z`
+before reporting them in PC JSON. Calibration runs automatically when the
+wristband first connects or reconnects, and can be repeated with a serial
+`wristband` calibrate command. Offsets are session-only and reset on Antenna
+reboot.
+
 ## Battery Status
 
 Wristband battery telemetry is sent 5 seconds after the wristband confirms the
@@ -254,9 +261,10 @@ Example:
       "t_ms": 123430,
       "accel": {"x": 0.01, "y": 0.02, "z": 9.81},
       "gyro": {"x": 0.1, "y": 0.2, "z": 0.3},
+      "calibration": {"status": "ok", "calibrating": false},
       "pitch": 1.2,
       "roll": -2.5,
-      "yaw": null
+      "yaw": 0.4
     },
     "camdock": {
       "status": "ok",
@@ -347,6 +355,21 @@ Fan control commands are:
   "fan_on": true
 }
 ```
+
+Wristband calibration commands are:
+
+```json
+{
+  "cmd": "wristband",
+  "control": "calibrate"
+}
+```
+
+Accepted `control` values: `calibrate`, `recalibrate`, `reset`,
+`reset_calibration`. The Antenna averages about 2 seconds of still wristband
+samples, stores session offsets, and prints status lines such as
+`ANTENNA_WRISTBAND_CALIBRATION:started` and
+`ANTENNA_WRISTBAND_CALIBRATION:complete,samples=N`.
 
 Fan controller OTA commands use the same `cmd: "ota"` shape as wristband OTA,
 with `"target": "fans"`.

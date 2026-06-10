@@ -430,6 +430,57 @@ class InputMapperRuntimeTests(unittest.TestCase):
         self.assertIsNone(hidden["hands.right.z_mm"].value)
         self.assertEqual(visible["hands.right.z_mm"].value, 700)
 
+    def test_keyboard_text_action_types_live_signal_value(self) -> None:
+        rule = MappingRule(
+            source="keyboard.input",
+            comparator="present",
+            action=MappingAction(type="keyboard_text", text_source="keyboard.input", append_space=True),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(
+            {"raw_device_state": {"devices": {"keyboard": {"input": "hello"}}}},
+            0.0,
+        )
+        mapper.process({"raw_device_state": {"devices": {"keyboard": {"input": None}}}}, 0.1)
+        mapper.process(
+            {"raw_device_state": {"devices": {"keyboard": {"input": "world"}}}},
+            0.2,
+        )
+        self.assertEqual(backend.events, [("type_text", "hello "), ("type_text", "world ")])
+
+    def test_keyboard_text_action_maps_command_words_to_keys(self) -> None:
+        rule = MappingRule(
+            source="keyboard.input",
+            comparator="present",
+            action=MappingAction(type="keyboard_text", text_source="keyboard.input", append_space=True),
+        )
+        mapper, backend = self.mapper_with([rule])
+        mapper.process(
+            {"raw_device_state": {"devices": {"keyboard": {"input": "backspace"}}}},
+            0.0,
+        )
+        self.assertEqual(backend.events, [("key_tap", ("backspace",))])
+
+    def test_signal_catalog_exposes_keyboard_prediction_fields(self) -> None:
+        signals = SignalCatalog.flatten(
+            {
+                "raw_device_state": {
+                    "devices": {
+                        "keyboard": {
+                            "input": "hello",
+                            "predicted_word": "hello",
+                            "prediction_confidence": 0.8,
+                            "prediction_sequence": 4,
+                            "model_loaded": True,
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(signals["keyboard.input"].value, "hello")
+        self.assertEqual(signals["keyboard.prediction_sequence"].value, 4)
+        self.assertTrue(signals["keyboard.model_loaded"].value)
+
 
 class MappingConfigTests(unittest.TestCase):
     def test_save_and_load_config(self) -> None:

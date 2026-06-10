@@ -22,10 +22,15 @@ LOG_DIR = PATHS.logs_dir
 TEMP_DIR = PATHS.temp_dir
 EXPORTS_DIR = PATHS.exports_dir
 GESTURE_DATA_DIR = PATHS.gesture_data_dir
+KEYBOARD_DATA_DIR = PATHS.keyboard_data_dir
+AUDIO_TRAINING_DIR = PATHS.audio_training_dir
 CALIBRATION_PATH = PATHS.calibration_path
 MAPPING_PATH = PATHS.mapping_path
 SERVO_DEBUG_LOG_PATH = PATHS.servo_debug_log_path
 AUDIO_RECORDING_PATH = PATHS.audio_recording_path
+KEYBOARD_DATASET_PATH = PATHS.keyboard_dataset_path
+KEYBOARD_MODEL_PATH = PATHS.keyboard_model_path
+KEYBOARD_WORDS_PATH = PATHS.keyboard_words_path
 
 
 DEFAULT_CALIBRATION: dict[str, Any] = {
@@ -124,8 +129,13 @@ class AppConfig:
     calibration_path: Path = CALIBRATION_PATH
     mapping_path: Path = MAPPING_PATH
     gesture_data_dir: Path = GESTURE_DATA_DIR
+    keyboard_data_dir: Path = KEYBOARD_DATA_DIR
+    audio_training_dir: Path = AUDIO_TRAINING_DIR
     servo_debug_log_path: Path = SERVO_DEBUG_LOG_PATH
     audio_recording_path: Path = AUDIO_RECORDING_PATH
+    keyboard_dataset_path: Path = KEYBOARD_DATASET_PATH
+    keyboard_model_path: Path = KEYBOARD_MODEL_PATH
+    keyboard_words_path: Path = KEYBOARD_WORDS_PATH
     calibration: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_CALIBRATION))
     startup_warnings: list[str] = field(default_factory=list)
 
@@ -227,8 +237,13 @@ def load_app_config() -> AppConfig:
         calibration_path=PATHS.calibration_path,
         mapping_path=PATHS.mapping_path,
         gesture_data_dir=PATHS.gesture_data_dir,
+        keyboard_data_dir=PATHS.keyboard_data_dir,
+        audio_training_dir=PATHS.audio_training_dir,
         servo_debug_log_path=PATHS.servo_debug_log_path,
         audio_recording_path=PATHS.audio_recording_path,
+        keyboard_dataset_path=PATHS.keyboard_dataset_path,
+        keyboard_model_path=PATHS.keyboard_model_path,
+        keyboard_words_path=PATHS.keyboard_words_path,
         calibration=calibration,
         startup_warnings=startup_warnings,
     )

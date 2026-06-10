@@ -35,7 +35,8 @@ enum AirTrixxMessageType : uint8_t {
   MSG_AUDIODOCK_DATA = 12,
   MSG_AUDIODOCK_AUDIO_CHUNK = 13,
   MSG_AUDIODOCK_TRANSCRIPT = 14,
-  MSG_CHARGING_DOCK_STATUS = 15
+  MSG_CHARGING_DOCK_STATUS = 15,
+  MSG_KEYBOARD_COMMAND = 16
 };
 
 static const uint8_t AIRTRIXX_OTA_SSID_MAX = 32;
@@ -61,6 +62,11 @@ enum AirTrixxActivePair : uint8_t {
   ACTIVE_PAIR_CAMERA = 3,
   ACTIVE_PAIR_HANDS  = 4,
   ACTIVE_PAIR_DOCK   = 5
+};
+
+enum AirTrixxKeyboardCommand : uint8_t {
+  KEYBOARD_CMD_NONE = 0,
+  KEYBOARD_CMD_RECALIBRATE = 1
 };
 
 enum AirTrixxServoMask : uint8_t {
@@ -164,6 +170,11 @@ struct AIRTRIXX_PACKED KeyboardTofPacket {
   uint8_t valid_2;
   uint8_t valid_3;
   uint8_t valid_4;
+};
+
+struct AIRTRIXX_PACKED KeyboardCommandPacket {
+  AirTrixxPacketHeader header;
+  uint8_t command;
 };
 
 struct AIRTRIXX_PACKED ChargingDockStatusPacket {

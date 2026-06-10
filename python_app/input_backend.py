@@ -22,6 +22,9 @@ class InputBackend(Protocol):
     def tap_keys(self, tokens: list[str]) -> None:
         ...
 
+    def type_text(self, text: str) -> None:
+        ...
+
     def press_mouse(self, button: str) -> None:
         ...
 
@@ -147,6 +150,9 @@ class PynputInputBackend:
         for key in reversed(keys):
             self._keyboard_controller.release(key)
 
+    def type_text(self, text: str) -> None:
+        self._keyboard_controller.type(str(text))
+
     def press_mouse(self, button: str) -> None:
         resolved = self._resolve_button(button)
         if resolved is not None:
@@ -222,6 +228,9 @@ class FakeInputBackend:
     def tap_keys(self, tokens: list[str]) -> None:
         normalized = [normalize_key_token(token) for token in tokens if normalize_key_token(token)]
         self.events.append(("key_tap", tuple(normalized)))
+
+    def type_text(self, text: str) -> None:
+        self.events.append(("type_text", str(text)))
 
     def press_mouse(self, button: str) -> None:
         self.events.append(("mouse_down", normalize_mouse_button(button)))
