@@ -92,9 +92,14 @@ static const uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x
 static const int8_t WIFI_TX_POWER_QDBM = 34;  // 8.5 dBm in 0.25 dBm units.
 static const uint8_t ANTENNA_TOTAL_TRACKED_DEVICES = 6;
 static const uint32_t ANTENNA_LED_UPDATE_MS = 250;
+static const uint32_t AUDIODOCK_STATUS_BROADCAST_MS = 1000;
 static const uint32_t AUDIODOCK_LED_TIMEOUT_MS = 30000;
+static const uint32_t AUDIODOCK_HEARTBEAT_TIMEOUT_MS = 5000;
 static uint8_t lastAntennaLedState = 255;
 static uint32_t lastAntennaLedUpdateMs = 0;
+static uint32_t lastAudioDockStatusBroadcastMs = 0;
+static bool latestAudioDockHeartbeatSeen = false;
+static uint32_t latestAudioDockHeartbeatMs = 0;
 
 #if defined(RGB_BUILTIN)
 static const uint8_t ANTENNA_STATUS_LED_PIN = RGB_BUILTIN;
@@ -119,7 +124,7 @@ bool stateFresh(bool seen, uint32_t receivedMs, uint32_t nowMs, uint32_t timeout
   return seen && (nowMs - receivedMs <= timeoutMs);
 }
 
-uint8_t connectedDeviceCount(uint32_t nowMs) {
+uint8_t connectedDeviceMask(uint32_t nowMs) {
   bool wristOk = false;
   bool camOk = false;
   bool keyboardOk = false;
@@ -133,16 +138,27 @@ uint8_t connectedDeviceCount(uint32_t nowMs) {
   keyboardOk = stateFresh(latestKeyboard.seen, latestKeyboard.received_ms, nowMs);
   chargingOk = stateFresh(latestChargingDock.seen, latestChargingDock.received_ms, nowMs);
   audioOk = stateFresh(latestAudioDock.seen, latestAudioDock.received_ms, nowMs, AUDIODOCK_LED_TIMEOUT_MS);
+  audioOk = audioOk || stateFresh(latestAudioDockHeartbeatSeen, latestAudioDockHeartbeatMs, nowMs, AUDIODOCK_HEARTBEAT_TIMEOUT_MS);
   fansOk = stateFresh(latestFans.seen, latestFans.received_ms, nowMs);
   portEXIT_CRITICAL(&stateMux);
 
+  uint8_t mask = 0;
+  if (wristOk) mask |= (1 << 0);
+  if (camOk) mask |= (1 << 1);
+  if (keyboardOk) mask |= (1 << 2);
+  if (chargingOk) mask |= (1 << 3);
+  if (audioOk) mask |= (1 << 4);
+  if (fansOk) mask |= (1 << 5);
+  return mask;
+}
+
+uint8_t connectedDeviceCountFromMask(uint8_t mask) {
   uint8_t count = 0;
-  if (wristOk) count++;
-  if (camOk) count++;
-  if (keyboardOk) count++;
-  if (chargingOk) count++;
-  if (audioOk) count++;
-  if (fansOk) count++;
+  for (uint8_t i = 0; i < ANTENNA_TOTAL_TRACKED_DEVICES; i++) {
+    if (mask & (1 << i)) {
+      count++;
+    }
+  }
   return count;
 }
 
@@ -152,7 +168,8 @@ void updateAntennaStatusLed(uint32_t nowMs) {
   }
   lastAntennaLedUpdateMs = nowMs;
 
-  uint8_t connected = connectedDeviceCount(nowMs);
+  uint8_t connectedMask = connectedDeviceMask(nowMs);
+  uint8_t connected = connectedDeviceCountFromMask(connectedMask);
   if (connected > ANTENNA_TOTAL_TRACKED_DEVICES) {
     connected = ANTENNA_TOTAL_TRACKED_DEVICES;
   }
@@ -164,27 +181,47 @@ void updateAntennaStatusLed(uint32_t nowMs) {
 
   switch (connected) {
     case 0:
-      setAntennaStatusLed(32, 0, 0);      // red
+      setAntennaStatusLed(32, 0, 0);
       break;
     case 1:
-      setAntennaStatusLed(24, 24, 24);    // white
+      setAntennaStatusLed(24, 24, 24);
       break;
     case 2:
-      setAntennaStatusLed(32, 24, 0);     // yellow
+      setAntennaStatusLed(32, 24, 0);
       break;
     case 3:
-      setAntennaStatusLed(0, 28, 48);     // ocean blue
+      setAntennaStatusLed(0, 28, 48);
       break;
     case 4:
-      setAntennaStatusLed(48, 0, 20);     // pink
+      setAntennaStatusLed(48, 0, 20);
       break;
     case 5:
-      setAntennaStatusLed(28, 0, 48);     // purple
+      setAntennaStatusLed(28, 0, 48);
       break;
     default:
-      setAntennaStatusLed(0, 32, 0);      // green
+      setAntennaStatusLed(0, 32, 0);
       break;
   }
+}
+
+void broadcastAudioDockStatusMask(uint32_t nowMs) {
+  if (nowMs - lastAudioDockStatusBroadcastMs < AUDIODOCK_STATUS_BROADCAST_MS) {
+    return;
+  }
+  lastAudioDockStatusBroadcastMs = nowMs;
+
+  uint8_t connectedMask = connectedDeviceMask(nowMs);
+  AudioDockTranscriptPacket packet = {};
+  fillHeader(packet.header,
+             MSG_AUDIODOCK_TRANSCRIPT,
+             DEVICE_ANTENNA,
+             ++antennaJsonSequence,
+             millis(),
+             false);
+  snprintf(packet.transcript, sizeof(packet.transcript), "__STATUS:%02X__", connectedMask);
+  esp_now_send(ESPNOW_BROADCAST_MAC,
+               reinterpret_cast<const uint8_t *>(&packet),
+               sizeof(packet));
 }
 
 void configureWiFiChannel() {
@@ -683,7 +720,14 @@ void handleIncomingPacket(const uint8_t *data, int len) {
     return;
   }
 
-  if (header.msg_type == MSG_WRISTBAND_DATA && len == static_cast<int>(sizeof(WristbandDataPacket))) {
+  if (header.msg_type == MSG_HEARTBEAT &&
+      header.device_id == DEVICE_AUDIODOCK &&
+      len == static_cast<int>(sizeof(HeartbeatPacket))) {
+    portENTER_CRITICAL(&stateMux);
+    latestAudioDockHeartbeatSeen = true;
+    latestAudioDockHeartbeatMs = millis();
+    portEXIT_CRITICAL(&stateMux);
+  } else if (header.msg_type == MSG_WRISTBAND_DATA && len == static_cast<int>(sizeof(WristbandDataPacket))) {
     WristbandDataPacket packet = {};
     memcpy(&packet, data, sizeof(packet));
     portENTER_CRITICAL(&stateMux);
@@ -1452,6 +1496,7 @@ void loop() {
 
   uint32_t nowMs = millis();
   updateAntennaStatusLed(nowMs);
+  broadcastAudioDockStatusMask(nowMs);
   
   if (isStreamingAudioDock && (nowMs - lastAudioDockChunkMs >= AUDIODOCK_STREAM_TIMEOUT_MS)) {
     isStreamingAudioDock = false;

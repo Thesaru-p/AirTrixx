@@ -30,6 +30,7 @@
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <stdlib.h>
 
 #if __has_include("../shared/AirTrixxConfig.h")
 #include "../shared/AirTrixxConfig.h"
@@ -50,8 +51,9 @@
 #define RECORD_GAIN 32
 #define SPEAK_DELAY_MS 900
 #define CLAP_INFERENCE_GAIN 16
-#define CLAP_LABEL_THRESHOLD 0.35f
-#define CLAP_COMBINED_THRESHOLD 0.45f
+#define CLAP_LABEL_THRESHOLD 0.20f
+#define CLAP_COMBINED_THRESHOLD 0.20f
+#define CLAP_NOISE_MARGIN 0.00f
 #define PRINT_CLAP_SCORES true
 #define WAV_HEADER_BYTES 44
 #define AUDIO_DATA_BYTES (RECORD_SECONDS * SAMPLE_RATE * sizeof(int16_t))
@@ -84,6 +86,11 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define LED_RING_COUNT 16
 #define LED_RING_BRIGHTNESS 32
 Adafruit_NeoPixel ledRing(LED_RING_COUNT, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
+static const uint8_t AUDIO_DOCK_RING_SEGMENTS = 8;
+static const uint8_t AUDIO_DOCK_COMPONENT_SEGMENTS = 6;
+static const uint8_t AUDIO_DOCK_LEDS_PER_SEGMENT = LED_RING_COUNT / AUDIO_DOCK_RING_SEGMENTS;
+static const uint32_t AUDIO_DOCK_HEARTBEAT_MS = 2000;
+static const uint32_t AUDIO_DOCK_RING_REFRESH_MS = 100;
 
 bool i2sReady = false;
 bool speakerReady = false;
@@ -93,6 +100,10 @@ uint16_t audioDockSequence = 0;
 uint8_t pendingTriggerType = 0;
 uint32_t recordedWavBytes = 0;
 String lastRecordError = "";
+static uint8_t antennaConnectionMask = 0;
+static bool hasAntennaConnectionMask = false;
+static uint32_t lastConnectionRingRefreshMs = 0;
+static uint32_t lastAudioDockHeartbeatMs = 0;
 
 // -------------------- Edge Impulse Inferencing Variables --------------------
 typedef struct {
@@ -118,6 +129,7 @@ void displayLCDTranscript(const String &transcript);
 void ringChase(uint8_t r, uint8_t g, uint8_t b, uint16_t head);
 void ringProgress(uint32_t current, uint32_t total, uint8_t r, uint8_t g, uint8_t b);
 void ringFlash(uint8_t r, uint8_t g, uint8_t b, uint8_t flashes, uint16_t onMs, uint16_t offMs);
+void ringShowConnectionMask(uint8_t mask);
 void ringShowReady();
 void ringShowSuccess();
 void ringShowError();
@@ -125,6 +137,7 @@ void runLedRingSelfTest();
 void disableOnboardLed();
 void playTranscriptionDoneSound();
 void runSpeakerSelfTest();
+void pumpAudioDockHeartbeat();
 
 // State machine states
 enum AudioDockState {
@@ -195,7 +208,31 @@ void ringFlash(uint8_t r, uint8_t g, uint8_t b, uint8_t flashes, uint16_t onMs, 
   }
 }
 
+void ringShowConnectionMask(uint8_t mask) {
+  ledRing.clear();
+
+  for (uint8_t segment = 0; segment < AUDIO_DOCK_COMPONENT_SEGMENTS; segment++) {
+    if ((mask & (1 << segment)) == 0) {
+      continue;
+    }
+
+    uint16_t firstPixel = segment * AUDIO_DOCK_LEDS_PER_SEGMENT;
+    for (uint8_t offset = 0; offset < AUDIO_DOCK_LEDS_PER_SEGMENT; offset++) {
+      uint16_t pixel = firstPixel + offset;
+      if (pixel < LED_RING_COUNT) {
+        ledRing.setPixelColor(pixel, ledRing.Color(0, 48, 0));
+      }
+    }
+  }
+
+  ledRing.show();
+}
+
 void ringShowReady() {
+  if (hasAntennaConnectionMask) {
+    ringShowConnectionMask(antennaConnectionMask);
+    return;
+  }
   ringFill(0, 0, 24);
 }
 
@@ -831,7 +868,11 @@ static int ei_i2s_deinit(void) {
 }
 
 static bool microphone_inference_start(uint32_t n_samples) {
-  inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
+  size_t inferenceBytes = n_samples * sizeof(int16_t);
+  inference.buffer = (int16_t *)heap_caps_malloc(inferenceBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (inference.buffer == NULL) {
+    inference.buffer = (int16_t *)heap_caps_malloc(inferenceBytes, MALLOC_CAP_8BIT);
+  }
   if (inference.buffer == NULL) {
     return false;
   }
@@ -909,6 +950,31 @@ bool addEspNowPeer(const uint8_t mac[6]) {
   return (esp_now_add_peer(&peer) == ESP_OK);
 }
 
+bool parseAntennaConnectionStatus(const String &incoming, uint8_t *mask) {
+  if (!incoming.startsWith("__STATUS:")) {
+    return false;
+  }
+
+  String maskText = incoming.substring(9);
+  int marker = maskText.indexOf("__");
+  if (marker >= 0) {
+    maskText = maskText.substring(0, marker);
+  }
+  maskText.trim();
+  if (maskText.length() == 0) {
+    return false;
+  }
+
+  char *endPtr = nullptr;
+  unsigned long value = strtoul(maskText.c_str(), &endPtr, 16);
+  if (endPtr == maskText.c_str()) {
+    return false;
+  }
+
+  *mask = static_cast<uint8_t>(value & 0xFF);
+  return true;
+}
+
 void handleIncomingPacket(const uint8_t *data, int len) {
   if (len < static_cast<int>(sizeof(AirTrixxPacketHeader))) {
     return;
@@ -925,6 +991,18 @@ void handleIncomingPacket(const uint8_t *data, int len) {
 
     String incoming = String(packet.transcript);
     incoming.trim();
+
+    uint8_t connectionMask = 0;
+    if (parseAntennaConnectionStatus(incoming, &connectionMask)) {
+      antennaConnectionMask = connectionMask;
+      hasAntennaConnectionMask = true;
+      if (currentState == STATE_INIT || currentState == STATE_WAIT_CLAP) {
+        ringShowConnectionMask(antennaConnectionMask);
+        lastConnectionRingRefreshMs = millis();
+      }
+      return;
+    }
+
     if (incoming == "__CMD:LEDTEST__") {
       if (lastRemoteCommandText == incoming && millis() - lastRemoteCommandMs < 1500) {
         return;
@@ -974,6 +1052,26 @@ bool sendEspNowToAntenna(const uint8_t *data, size_t len, uint8_t retries = 10) 
   }
   Serial.printf("ESP-NOW send failed: %d\n", result);
   return false;
+}
+
+bool sendAudioDockHeartbeat() {
+  HeartbeatPacket heartbeat = {};
+  fillHeader(heartbeat.header,
+             MSG_HEARTBEAT,
+             DEVICE_AUDIODOCK,
+             ++audioDockSequence,
+             millis(),
+             false);
+  return sendEspNowToAntenna(reinterpret_cast<const uint8_t *>(&heartbeat), sizeof(heartbeat), 2);
+}
+
+void pumpAudioDockHeartbeat() {
+  uint32_t nowMs = millis();
+  if (nowMs - lastAudioDockHeartbeatMs < AUDIO_DOCK_HEARTBEAT_MS) {
+    return;
+  }
+  lastAudioDockHeartbeatMs = nowMs;
+  sendAudioDockHeartbeat();
 }
 
 bool sendAudioDockTrigger(uint8_t triggerType, uint32_t audioSize) {
@@ -1249,6 +1347,7 @@ void setup() {
 
 void loop() {
   pollLocalSerialCommands();
+  pumpAudioDockHeartbeat();
 
   switch (currentState) {
     case STATE_WAIT_CLAP: {
@@ -1258,7 +1357,7 @@ void loop() {
       snprintf(macLcd, sizeof(macLcd), "MAC:%02X%02X%02X%02X%02X%02X",
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       displayLCDStatus("Clap to speak!", macLcd);
-      ringChase(0, 0, 80, 0);
+      ringShowReady();
       
       if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
         displayLCDStatus("Inference Err", "Memory failed");
@@ -1273,7 +1372,15 @@ void loop() {
 
       while (!clapDetected) {
         pollLocalSerialCommands();
-        ringChase(0, 0, 80, listeningStep++);
+        pumpAudioDockHeartbeat();
+        if (millis() - lastConnectionRingRefreshMs >= AUDIO_DOCK_RING_REFRESH_MS) {
+          if (hasAntennaConnectionMask) {
+            ringShowConnectionMask(antennaConnectionMask);
+          } else {
+            ringChase(0, 0, 80, listeningStep++);
+          }
+          lastConnectionRingRefreshMs = millis();
+        }
 
         bool m = microphone_inference_record();
         if (!m) {
@@ -1319,24 +1426,29 @@ void loop() {
             doubleClapScore = val;
           } else if (label.equalsIgnoreCase("Noice") || label.equalsIgnoreCase("Noise")) {
             noiseScore = val;
+          } else if (val > noiseScore) {
+            noiseScore = val;
           }
         }
 
         float combinedClapScore = singleClapScore + doubleClapScore;
-        bool bestIsClap = bestLabel.equalsIgnoreCase("Single clap") || bestLabel.equalsIgnoreCase("Double clap");
-        bool strongSingleOrDouble = singleClapScore >= CLAP_LABEL_THRESHOLD || doubleClapScore >= CLAP_LABEL_THRESHOLD;
-        bool combinedClapWins = combinedClapScore >= CLAP_COMBINED_THRESHOLD && combinedClapScore > noiseScore;
+        float strongestClapScore = doubleClapScore > singleClapScore ? doubleClapScore : singleClapScore;
+        bool strongSingleOrDouble = strongestClapScore >= CLAP_LABEL_THRESHOLD;
+        bool combinedClapWins = combinedClapScore >= CLAP_COMBINED_THRESHOLD;
+        bool clapClearsNoiseGate = CLAP_NOISE_MARGIN <= 0.0f || combinedClapScore >= (noiseScore + CLAP_NOISE_MARGIN);
+        bool acceptClap = clapClearsNoiseGate && (strongSingleOrDouble || combinedClapWins);
 
         if (PRINT_CLAP_SCORES) {
           uint32_t peak = lastInferencePeak;
-          Serial.printf(" combined=%.2f best=%s %.2f peak=%lu\n",
+          Serial.printf(" combined=%.2f best=%s %.2f peak=%lu accept=%u\n",
                         combinedClapScore,
                         bestLabel.c_str(),
                         bestScore,
-                        (unsigned long)peak);
+                        (unsigned long)peak,
+                        acceptClap ? 1 : 0);
         }
 
-        if ((bestIsClap && strongSingleOrDouble) || combinedClapWins) {
+        if (acceptClap) {
           triggerType = doubleClapScore > singleClapScore ? 2 : 1;
           const char *triggerLabel = triggerType == 2 ? "Double clap" : "Single clap";
           float triggerScore = triggerType == 2 ? doubleClapScore : singleClapScore;
@@ -1416,6 +1528,7 @@ void loop() {
       
       while (!transcriptReceived && (millis() - transcriptWaitStartMs < TRANSCRIPT_TIMEOUT_MS)) {
         pollLocalSerialCommands();
+        pumpAudioDockHeartbeat();
         if (millis() - lastRingUpdate >= 100) {
           ringChase(64, 0, 80, waitStep++);
           lastRingUpdate = millis();
